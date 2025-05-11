@@ -67,7 +67,7 @@ func TestPrefix(t *testing.T) {
 	}
 	ctx := context.Background()
 	for _, prefix := range prefixes {
-		fs := NewMemFS()
+		fs := adaptFileSystem(NewMemFS())
 		h := &Handler{
 			FileSystem: fs,
 			LockSystem: NewMemLS(),
@@ -348,8 +348,9 @@ func TestFilenameEscape(t *testing.T) {
 }
 
 func TestPutRequest(t *testing.T) {
+	fs := adaptFileSystem(NewMemFS())
 	h := &Handler{
-		FileSystem: NewMemFS(),
+		FileSystem: fs,
 		LockSystem: NewMemLS(),
 	}
 	srv := httptest.NewServer(h)

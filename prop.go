@@ -11,11 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Proppatch describes a property update instruction as defined in RFC 4918.
@@ -103,7 +104,7 @@ type DeadPropsHolder interface {
 var liveProps = map[xml.Name]struct {
 	// findFn implements the propfind function of this property. If nil,
 	// it indicates a hidden property.
-	findFn func(context.Context, FileSystem, LockSystem, string, os.FileInfo) (string, error)
+	findFn func(context.Context, FileSystem, LockSystem, string, FileInfo) (string, error)
 	// dir is true if the property applies to directories.
 	dir bool
 }{
@@ -167,72 +168,175 @@ var liveProps = map[xml.Name]struct {
 // Each Propstat has a unique status and each property name will only be part
 // of one Propstat element.
 func props(ctx context.Context, fs FileSystem, ls LockSystem, name string, pnames []xml.Name) ([]Propstat, error) {
-	f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	isDir := fi.IsDir()
-
+	// 检查文件是否存在
+	var fileInfo FileInfo
 	var deadProps map[xml.Name]Property
-	if dph, ok := f.(DeadPropsHolder); ok {
-		deadProps, err = dph.DeadProps()
+
+	if name == "/" {
+		// 处理根目录的特殊情况
+		fileInfo = &simpleFileInfo{
+			name:    "/",
+			size:    0,
+			mode:    os.ModeDir | 0777,
+			modTime: time.Now(),
+			mime:    "httpd/unix-directory",
+		}
+	} else {
+		// 获取文件信息
+		parentDir := path.Dir(name)
+		fileInfos, err := fs.List(ctx, parentDir)
 		if err != nil {
 			return nil, err
 		}
+
+		found := false
+		for _, info := range fileInfos {
+			if info.Name() == path.Base(name) {
+				fileInfo = info
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil, os.ErrNotExist
+		}
 	}
 
-	pstatOK := Propstat{Status: http.StatusOK}
-	pstatNotFound := Propstat{Status: http.StatusNotFound}
+	// 尝试下载文件以获取 DeadProps（如果支持）
+	if !fileInfo.IsDir() {
+		body, err := fs.Download(ctx, name)
+		if err == nil {
+			if dph, ok := body.(DeadPropsHolder); ok {
+				deadProps, err = dph.DeadProps()
+				if err != nil {
+					return nil, err
+				}
+			}
+			if closer, ok := body.(io.Closer); ok {
+				closer.Close()
+			}
+		}
+	}
+
+	// 如果文件是目录，尝试通过 List 获取更多信息
+	if fileInfo.IsDir() {
+		// 对于目录，我们不尝试获取 DeadProps
+		// 因为目录通常没有关联的实际文件内容
+	}
+
+	// 处理属性
+	okPnames := make([]xml.Name, 0, len(pnames))
+	unknownPnames := make([]xml.Name, 0, len(pnames))
 	for _, pn := range pnames {
-		// If this file has dead properties, check if they contain pn.
-		if dp, ok := deadProps[pn]; ok {
-			pstatOK.Props = append(pstatOK.Props, dp)
+		if _, ok := liveProps[pn]; ok {
+			okPnames = append(okPnames, pn)
 			continue
 		}
-		// Otherwise, it must either be a live property or we don't know it.
-		if prop := liveProps[pn]; prop.findFn != nil && (prop.dir || !isDir) {
-			innerXML, err := prop.findFn(ctx, fs, ls, name, fi)
+		if deadProps != nil {
+			if _, ok := deadProps[pn]; ok {
+				okPnames = append(okPnames, pn)
+				continue
+			}
+		}
+		unknownPnames = append(unknownPnames, pn)
+	}
+
+	// 创建属性结果
+	failedPS := Propstat{Status: http.StatusNotFound}
+	successPS := Propstat{Status: http.StatusOK}
+
+	// 添加已知属性
+	for _, pn := range okPnames {
+		if prop := liveProps[pn]; prop.findFn != nil && (prop.dir || !fileInfo.IsDir()) {
+			innerXML, err := prop.findFn(ctx, fs, ls, name, fileInfo)
 			if err != nil {
 				return nil, err
 			}
-			pstatOK.Props = append(pstatOK.Props, Property{
+			successPS.Props = append(successPS.Props, Property{
 				XMLName:  pn,
 				InnerXML: []byte(innerXML),
 			})
-		} else {
-			pstatNotFound.Props = append(pstatNotFound.Props, Property{
-				XMLName: pn,
-			})
+		} else if deadProps != nil {
+			if p, ok := deadProps[pn]; ok {
+				successPS.Props = append(successPS.Props, p)
+			}
 		}
 	}
-	return makePropstats(pstatOK, pstatNotFound), nil
+
+	// 添加未知属性作为失败项
+	for _, pn := range unknownPnames {
+		failedPS.Props = append(failedPS.Props, Property{
+			XMLName: pn,
+		})
+	}
+
+	return makePropstats(successPS, failedPS), nil
 }
 
 // propnames returns the property names defined for resource name.
 func propnames(ctx context.Context, fs FileSystem, ls LockSystem, name string) ([]xml.Name, error) {
-	f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	isDir := fi.IsDir()
-
+	// 检查文件是否存在
+	var fileInfo FileInfo
 	var deadProps map[xml.Name]Property
-	if dph, ok := f.(DeadPropsHolder); ok {
-		deadProps, err = dph.DeadProps()
+
+	if name == "/" {
+		// 处理根目录的特殊情况
+		fileInfo = &simpleFileInfo{
+			name:    "/",
+			size:    0,
+			mode:    os.ModeDir | 0777,
+			modTime: time.Now(),
+			mime:    "httpd/unix-directory",
+		}
+	} else {
+		// 获取文件信息
+		parentDir := path.Dir(name)
+		fileInfos, err := fs.List(ctx, parentDir)
 		if err != nil {
 			return nil, err
 		}
+
+		found := false
+		for _, info := range fileInfos {
+			if info.Name() == path.Base(name) {
+				fileInfo = info
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil, os.ErrNotExist
+		}
+
+		// 如果是非目录文件，获取其内容以处理 DeadProps
+		if !fileInfo.IsDir() {
+			file, err := fs.Download(ctx, name)
+			if err != nil {
+				return nil, err
+			}
+
+			// 处理 DeadProps
+			if dph, ok := file.(DeadPropsHolder); ok {
+				deadProps, err = dph.DeadProps()
+				if err != nil {
+					// 确保关闭文件
+					if closer, ok := file.(io.Closer); ok {
+						closer.Close()
+					}
+					return nil, err
+				}
+			}
+
+			// 确保关闭文件
+			if closer, ok := file.(io.Closer); ok {
+				closer.Close()
+			}
+		}
 	}
+
+	isDir := fileInfo.IsDir()
 
 	pnames := make([]xml.Name, 0, len(liveProps)+len(deadProps))
 	for pn, prop := range liveProps {
@@ -259,138 +363,98 @@ func allprop(ctx context.Context, fs FileSystem, ls LockSystem, name string, inc
 	if err != nil {
 		return nil, err
 	}
-	// Add names from include if they are not already covered in pnames.
-	nameset := make(map[xml.Name]bool)
+	// Add the properties named in include, avoiding duplicates.
+	set := make(map[xml.Name]bool)
 	for _, pn := range pnames {
-		nameset[pn] = true
+		set[pn] = true
 	}
 	for _, pn := range include {
-		if !nameset[pn] {
+		if !set[pn] {
 			pnames = append(pnames, pn)
 		}
 	}
 	return props(ctx, fs, ls, name, pnames)
 }
 
-// patch patches the properties of resource name. The return values are
-// constrained in the same manner as DeadPropsHolder.Patch.
+// patch applies the patches to the resource named in the request.
 func patch(ctx context.Context, fs FileSystem, ls LockSystem, name string, patches []Proppatch) ([]Propstat, error) {
-	conflict := false
-loop:
-	for _, patch := range patches {
-		for _, p := range patch.Props {
-			if _, ok := liveProps[p.XMLName]; ok {
-				conflict = true
-				break loop
-			}
-		}
-	}
-	if conflict {
-		pstatForbidden := Propstat{
-			Status:   http.StatusForbidden,
-			XMLError: `<D:cannot-modify-protected-property xmlns:D="DAV:"/>`,
-		}
-		pstatFailedDep := Propstat{
-			Status: StatusFailedDependency,
-		}
-		for _, patch := range patches {
-			for _, p := range patch.Props {
-				if _, ok := liveProps[p.XMLName]; ok {
-					pstatForbidden.Props = append(pstatForbidden.Props, Property{XMLName: p.XMLName})
-				} else {
-					pstatFailedDep.Props = append(pstatFailedDep.Props, Property{XMLName: p.XMLName})
-				}
-			}
-		}
-		return makePropstats(pstatForbidden, pstatFailedDep), nil
-	}
-
-	f, err := fs.OpenFile(ctx, name, os.O_RDWR, 0)
+	// 处理 DeadProps
+	file, err := fs.Download(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	if dph, ok := f.(DeadPropsHolder); ok {
-		ret, err := dph.Patch(patches)
-		if err != nil {
-			return nil, err
+	defer func() {
+		if closer, ok := file.(io.Closer); ok {
+			closer.Close()
 		}
-		// http://www.webdav.org/specs/rfc4918.html#ELEMENT_propstat says that
-		// "The contents of the prop XML element must only list the names of
-		// properties to which the result in the status element applies."
-		for _, pstat := range ret {
-			for i, p := range pstat.Props {
-				pstat.Props[i] = Property{XMLName: p.XMLName}
-			}
-		}
-		return ret, nil
+	}()
+
+	dph, ok := file.(DeadPropsHolder)
+	if !ok {
+		return nil, errNoDeadPropsHolder
 	}
-	// The file doesn't implement the optional DeadPropsHolder interface, so
-	// all patches are forbidden.
+
+	// 检查请求的属性中哪些是活属性（不能被修改）
 	pstat := Propstat{Status: http.StatusForbidden}
 	for _, patch := range patches {
 		for _, p := range patch.Props {
-			pstat.Props = append(pstat.Props, Property{XMLName: p.XMLName})
+			if _, ok := liveProps[p.XMLName]; ok {
+				pstat.Props = append(pstat.Props, Property{XMLName: p.XMLName})
+			}
 		}
 	}
-	return []Propstat{pstat}, nil
+
+	// 修补死属性
+	pstats, err := dph.Patch(patches)
+	if err != nil {
+		return nil, err
+	}
+
+	// 返回结果
+	if len(pstat.Props) == 0 {
+		return pstats, nil
+	}
+	return append(pstats, pstat), nil
 }
 
+var errNoDeadPropsHolder = errors.New("webdav: no DeadPropsHolder")
+
+// escapeXML writes s to w with reserved xml characters (<, >, &) escaped.
 func escapeXML(s string) string {
-	for i := 0; i < len(s); i++ {
-		// As an optimization, if s contains only ASCII letters, digits or a
-		// few special characters, the escaped value is s itself and we don't
-		// need to allocate a buffer and convert between string and []byte.
-		switch c := s[i]; {
-		case c == ' ' || c == '_' ||
-			('+' <= c && c <= '9') || // Digits as well as + , - . and /
-			('A' <= c && c <= 'Z') ||
-			('a' <= c && c <= 'z'):
-			continue
-		}
-		// Otherwise, go through the full escaping process.
-		var buf bytes.Buffer
-		xml.EscapeText(&buf, []byte(s))
-		return buf.String()
-	}
-	return s
+	var buf bytes.Buffer
+	xml.Escape(&buf, []byte(s))
+	return buf.String()
 }
 
-func findResourceType(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
+// findResourceType returns the XML representation of the resource type of
+// file, or returns an error if it's not a recognized resource type.
+func findResourceType(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
 	if fi.IsDir() {
-		return `<D:collection xmlns:D="DAV:"/>`, nil
+		return `<collection xmlns="DAV:"/>`, nil
 	}
 	return "", nil
 }
 
-func findDisplayName(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
-	if slashClean(name) == "/" {
+// findDisplayName returns the XML representation of the display name of file.
+func findDisplayName(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
+	if name == "/" {
 		// Hide the real name of a possibly prefixed root directory.
-		return "", nil
+		return escapeXML(string(filepath.Separator)), nil
 	}
 	return escapeXML(fi.Name()), nil
 }
 
-func findContentLength(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
+// findContentLength returns the XML representation of the content length of file.
+func findContentLength(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
 	return strconv.FormatInt(fi.Size(), 10), nil
 }
 
-func findLastModified(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
+// findLastModified returns the XML representation of the last modification time of file.
+func findLastModified(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
 	return fi.ModTime().UTC().Format(http.TimeFormat), nil
 }
 
-// ErrNotImplemented should be returned by optional interfaces if they
-// want the original implementation to be used.
-var ErrNotImplemented = errors.New("not implemented")
-
-// ContentTyper is an optional interface for the os.FileInfo
-// objects returned by the FileSystem.
-//
-// If this interface is defined then it will be used to read the
-// content type from the object.
-//
-// If this interface is not defined the file will be opened and the
-// content type will be guessed from the initial contents of the file.
+// ContentTyper is an optional interface for a FileInfo to report its MIME Content-Type.
 type ContentTyper interface {
 	// ContentType returns the content type for the file.
 	//
@@ -400,43 +464,35 @@ type ContentTyper interface {
 	ContentType(ctx context.Context) (string, error)
 }
 
-func findContentType(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
-	if do, ok := fi.(ContentTyper); ok {
-		ctype, err := do.ContentType(ctx)
-		if err != ErrNotImplemented {
-			return ctype, err
+// errNotImplemented implies that a method is not supported.
+var errNotImplemented = errors.New("webdav: not implemented")
+
+// findContentType returns the XML representation of the content type of file.
+func findContentType(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
+	if fi.IsDir() {
+		return "httpd/unix-directory", nil
+	}
+
+	if cter, ok := fi.(ContentTyper); ok {
+		ct, err := cter.ContentType(ctx)
+		if err == nil {
+			return ct, nil
+		}
+		if err != errNotImplemented {
+			return "", err
 		}
 	}
-	f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
-	if err != nil {
-		return "", err
+
+	// 使用 FileInfo 的 Mime 方法
+	if mime := fi.Mime(); mime != "" {
+		return mime, nil
 	}
-	defer f.Close()
-	// This implementation is based on serveContent's code in the standard net/http package.
-	ctype := mime.TypeByExtension(filepath.Ext(name))
-	if ctype != "" {
-		return ctype, nil
-	}
-	// Read a chunk to decide between utf-8 text and binary.
-	var buf [512]byte
-	n, err := io.ReadFull(f, buf[:])
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", err
-	}
-	ctype = http.DetectContentType(buf[:n])
-	// Rewind file.
-	_, err = f.Seek(0, io.SeekStart)
-	return ctype, err
+
+	// 返回一个默认的MIME类型
+	return "application/octet-stream", nil
 }
 
-// ETager is an optional interface for the os.FileInfo objects
-// returned by the FileSystem.
-//
-// If this interface is defined then it will be used to read the ETag
-// for the object.
-//
-// If this interface is not defined an ETag will be computed using the
-// ModTime() and the Size() methods of the os.FileInfo object.
+// ETager is an optional interface for a FileInfo to report its ETag.
 type ETager interface {
 	// ETag returns an ETag for the file.  This should be of the
 	// form "value" or W/"value"
@@ -447,23 +503,33 @@ type ETager interface {
 	ETag(ctx context.Context) (string, error)
 }
 
-func findETag(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
-	if do, ok := fi.(ETager); ok {
-		etag, err := do.ETag(ctx)
-		if err != ErrNotImplemented {
-			return etag, err
+// findETag returns the XML representation of the ETag of file.
+func findETag(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
+	if etager, ok := fi.(ETager); ok {
+		et, err := etager.ETag(ctx)
+		if err == nil {
+			return et, nil
+		}
+		if err != errNotImplemented {
+			return "", err
 		}
 	}
-	// The Apache http 2.4 web server by default concatenates the
-	// modification time and size of a file. We replicate the heuristic
-	// with nanosecond granularity.
-	return fmt.Sprintf(`"%x%x"`, fi.ModTime().UnixNano(), fi.Size()), nil
+
+	// 如果ETager接口不可用，则生成基本的ETag
+	modTime := fi.ModTime()
+	size := fi.Size()
+	return fmt.Sprintf(`"%x%x"`, modTime.UnixNano(), size), nil
 }
 
-func findSupportedLock(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi os.FileInfo) (string, error) {
+// findSupportedLock returns the XML representation of the supported locks for file.
+func findSupportedLock(ctx context.Context, fs FileSystem, ls LockSystem, name string, fi FileInfo) (string, error) {
 	return `` +
-		`<D:lockentry xmlns:D="DAV:">` +
-		`<D:lockscope><D:exclusive/></D:lockscope>` +
-		`<D:locktype><D:write/></D:locktype>` +
-		`</D:lockentry>`, nil
+		`<lockentry xmlns="DAV:">` +
+		`<lockscope><exclusive/></lockscope>` +
+		`<locktype><write/></locktype>` +
+		`</lockentry>` +
+		`<lockentry xmlns="DAV:">` +
+		`<lockscope><shared/></lockscope>` +
+		`<locktype><write/></locktype>` +
+		`</lockentry>`, nil
 }

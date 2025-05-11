@@ -6,6 +6,7 @@
 package webdav // import "golang.org/x/net/webdav"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -177,13 +178,22 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 	}
 	ctx := r.Context()
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
-	if fi, err := h.FileSystem.Stat(ctx, reqPath); err == nil {
-		if fi.IsDir() {
-			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
-		} else {
-			allow = "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT"
+
+	// 检查路径是否为目录
+	fileInfos, err := h.FileSystem.List(ctx, path.Dir(reqPath))
+	if err == nil {
+		for _, info := range fileInfos {
+			if info.Name() == path.Base(reqPath) {
+				if info.IsDir() {
+					allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
+				} else {
+					allow = "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT"
+				}
+				break
+			}
 		}
 	}
+
 	w.Header().Set("Allow", allow)
 	// http://www.webdav.org/specs/rfc4918.html#dav.compliance.classes
 	w.Header().Set("DAV", "1, 2")
@@ -199,25 +209,49 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	}
 	// TODO: check locks for read-only access??
 	ctx := r.Context()
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
+
+	fileBody, err := h.FileSystem.Download(ctx, reqPath)
 	if err != nil {
 		return http.StatusNotFound, err
 	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return http.StatusNotFound, err
+
+	defer func() {
+		if closer, ok := fileBody.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
+	// 检查是否有 URL，有则进行 302 重定向
+	if url := fileBody.URL(); url != "" {
+		w.Header().Set("Location", url)
+		return http.StatusFound, nil
 	}
-	if fi.IsDir() {
-		return http.StatusMethodNotAllowed, nil
+
+	// 计算 ETag
+	modTime := fileBody.ModTime()
+	size := fileBody.Size()
+	etag := fmt.Sprintf(`"%x%x"`, modTime.UnixNano(), size)
+
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Type", fileBody.Mime())
+
+	// 设置内容长度
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileBody.Size()))
+
+	// 设置最后修改时间
+	w.Header().Set("Last-Modified", fileBody.ModTime().UTC().Format(http.TimeFormat))
+
+	// 如果是 HEAD 请求，不需要发送内容
+	if r.Method == "HEAD" {
+		return http.StatusOK, nil
 	}
-	etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, fi)
+
+	// 发送文件内容
+	_, err = io.Copy(w, fileBody)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
-	w.Header().Set("ETag", etag)
-	// Let ServeContent determine the Content-Type header.
-	http.ServeContent(w, r, reqPath, fi.ModTime(), f)
+
 	return 0, nil
 }
 
@@ -236,16 +270,25 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 
 	// TODO: return MultiStatus where appropriate.
 
-	// "godoc os RemoveAll" says that "If the path does not exist, RemoveAll
-	// returns nil (no error)." WebDAV semantics are that it should return a
-	// "404 Not Found". We therefore have to Stat before we RemoveAll.
-	if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusNotFound, err
-		}
+	// 检查文件是否存在
+	fileInfos, err := h.FileSystem.List(ctx, path.Dir(reqPath))
+	if err != nil {
 		return http.StatusMethodNotAllowed, err
 	}
-	if err := h.FileSystem.RemoveAll(ctx, reqPath); err != nil {
+
+	exists := false
+	for _, info := range fileInfos {
+		if info.Name() == path.Base(reqPath) {
+			exists = true
+			break
+		}
+	}
+
+	if !exists {
+		return http.StatusNotFound, os.ErrNotExist
+	}
+
+	if err := h.FileSystem.Remove(ctx, reqPath); err != nil {
 		return http.StatusMethodNotAllowed, err
 	}
 	return http.StatusNoContent, nil
@@ -261,35 +304,26 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		return status, err
 	}
 	defer release()
-	// TODO(rost): Support the If-Match, If-None-Match headers? See bradfitz'
-	// comments in http.checkEtag.
-	ctx := r.Context()
 
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	// TODO: support the If-Match, If-None-Match headers? See RFC 7232.
+
+	// 创建一个 FileBody 实现来包装请求体
+	fileBody := &requestFileBody{
+		Reader: r.Body,
+		info: &simpleFileInfo{
+			name:    path.Base(reqPath),
+			size:    r.ContentLength,
+			mode:    0666,
+			modTime: time.Now(),
+			mime:    r.Header.Get("Content-Type"),
+		},
+	}
+
+	ctx := r.Context()
+	err = h.FileSystem.Put(ctx, reqPath, fileBody)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusConflict, err
-		}
-		return http.StatusNotFound, err
+		return http.StatusMethodNotAllowed, err
 	}
-	_, copyErr := io.Copy(f, r.Body)
-	fi, statErr := f.Stat()
-	closeErr := f.Close()
-	// TODO(rost): Returning 405 Method Not Allowed might not be appropriate.
-	if copyErr != nil {
-		return http.StatusMethodNotAllowed, copyErr
-	}
-	if statErr != nil {
-		return http.StatusMethodNotAllowed, statErr
-	}
-	if closeErr != nil {
-		return http.StatusMethodNotAllowed, closeErr
-	}
-	etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, fi)
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-	w.Header().Set("ETag", etag)
 	return http.StatusCreated, nil
 }
 
@@ -312,6 +346,9 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	if err := h.FileSystem.Mkdir(ctx, reqPath, 0777); err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusConflict, err
+		}
+		if os.IsExist(err) {
+			return http.StatusMethodNotAllowed, err
 		}
 		return http.StatusMethodNotAllowed, err
 	}
@@ -352,23 +389,21 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 
 	if r.Method == "COPY" {
 		// Section 7.5.1 says that a COPY only needs to lock the destination,
-		// not both destination and source. Strictly speaking, this is racy,
-		// even though a COPY doesn't modify the source, if a concurrent
-		// operation modifies the source. However, the litmus test explicitly
-		// checks that COPYing a locked-by-another source is OK.
+		// not both destination and source. Section 9.8.4 says that
+		// servers should ensure that locks are maintained during COPY.
 		release, status, err := h.confirmLocks(r, "", dst)
 		if err != nil {
 			return status, err
 		}
 		defer release()
 
-		// Section 9.8.3 says that "The COPY method on a collection without a Depth
+		// Section 9.8.3 says "The COPY method on a collection without a Depth
 		// header must act as if a Depth header with value "infinity" was included".
 		depth := infiniteDepth
 		if hdr := r.Header.Get("Depth"); hdr != "" {
 			depth = parseDepth(hdr)
 			if depth != 0 && depth != infiniteDepth {
-				// Section 9.8.3 says that "A client may submit a Depth header on a
+				// Section 9.8.3 says "A client may submit a Depth header on a
 				// COPY on a collection with a value of "0" or "infinity"."
 				return http.StatusBadRequest, errInvalidDepth
 			}
@@ -376,21 +411,22 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 		return copyFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") != "F", depth, 0)
 	}
 
+	// r.Method == "MOVE"
 	release, status, err := h.confirmLocks(r, src, dst)
 	if err != nil {
 		return status, err
 	}
 	defer release()
 
-	// Section 9.9.2 says that "The MOVE method on a collection must act as if
-	// a "Depth: infinity" header was used on it. A client must not submit a
-	// Depth header on a MOVE on a collection with any value but "infinity"."
+	// Section 9.9.2 says "The MOVE method on a collection must act as if
+	// a "Depth: infinity" header was used on it. A client must not submit
+	// a Depth header on a MOVE on a collection with any value but "infinity"."
 	if hdr := r.Header.Get("Depth"); hdr != "" {
 		if parseDepth(hdr) != infiniteDepth {
 			return http.StatusBadRequest, errInvalidDepth
 		}
 	}
-	return moveFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") == "T")
+	return moveFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") != "F")
 }
 
 func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus int, retErr error) {
@@ -460,14 +496,34 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 			}
 		}()
 
-		// Create the resource if it didn't previously exist.
-		if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
-			f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-			if err != nil {
-				// TODO: detect missing intermediate dirs and return http.StatusConflict?
+		// 创建资源，如果它尚不存在
+		// 检查资源是否存在
+		fileInfos, err := h.FileSystem.List(ctx, path.Dir(reqPath))
+		exists := false
+		if err == nil {
+			for _, info := range fileInfos {
+				if info.Name() == path.Base(reqPath) {
+					exists = true
+					break
+				}
+			}
+		}
+
+		if !exists {
+			// 创建一个空文件
+			emptyBody := &requestFileBody{
+				Reader: strings.NewReader(""),
+				info: &simpleFileInfo{
+					name:    path.Base(reqPath),
+					size:    0,
+					mode:    0666,
+					modTime: time.Now(),
+					mime:    "application/octet-stream",
+				},
+			}
+			if err := h.FileSystem.Put(ctx, reqPath, emptyBody); err != nil {
 				return http.StatusInternalServerError, err
 			}
-			f.Close()
 			created = true
 		}
 
@@ -516,13 +572,39 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 		return status, err
 	}
 	ctx := r.Context()
-	fi, err := h.FileSystem.Stat(ctx, reqPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusNotFound, err
+
+	// 检查请求路径是否存在
+	var fi FileInfo
+	var fileExists bool
+
+	if reqPath == "/" {
+		// 处理根路径
+		fileExists = true
+		fi = &simpleFileInfo{
+			name:    "/",
+			size:    0,
+			mode:    os.ModeDir | 0777,
+			modTime: time.Now(),
+			mime:    "httpd/unix-directory",
 		}
-		return http.StatusMethodNotAllowed, err
+	} else {
+		// 查找文件或目录
+		fileInfos, err := h.FileSystem.List(ctx, path.Dir(reqPath))
+		if err == nil {
+			for _, info := range fileInfos {
+				if info.Name() == path.Base(reqPath) {
+					fileExists = true
+					fi = info
+					break
+				}
+			}
+		}
 	}
+
+	if !fileExists {
+		return http.StatusNotFound, os.ErrNotExist
+	}
+
 	depth := infiniteDepth
 	if hdr := r.Header.Get("Depth"); hdr != "" {
 		depth = parseDepth(hdr)
@@ -537,16 +619,17 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 
 	mw := multistatusWriter{w: w}
 
-	walkFn := func(reqPath string, info os.FileInfo, err error) error {
+	// 调整walkFn从FileInfo使用
+	walkFn := func(reqPath string, info FileInfo, err error) error {
 		if err != nil {
-			return handlePropfindError(err, info)
+			return handlePropfindError(err, compatFileInfo{info})
 		}
 
 		var pstats []Propstat
 		if pf.Propname != nil {
 			pnames, err := propnames(ctx, h.FileSystem, h.LockSystem, reqPath)
 			if err != nil {
-				return handlePropfindError(err, info)
+				return handlePropfindError(err, compatFileInfo{info})
 			}
 			pstat := Propstat{Status: http.StatusOK}
 			for _, xmlname := range pnames {
@@ -559,7 +642,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 			pstats, err = props(ctx, h.FileSystem, h.LockSystem, reqPath, pf.Prop)
 		}
 		if err != nil {
-			return handlePropfindError(err, info)
+			return handlePropfindError(err, compatFileInfo{info})
 		}
 		href := path.Join(h.Prefix, reqPath)
 		if href != "/" && info.IsDir() {
@@ -568,7 +651,16 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 		return mw.write(makePropstatResponse(href, pstats))
 	}
 
-	walkErr := walkFS(ctx, h.FileSystem, depth, reqPath, fi, walkFn)
+	// 执行自定义的目录遍历
+	var walkErr error
+	if fi.IsDir() {
+		if walkErr = walkFn(reqPath, fi, nil); walkErr == nil && depth != 0 {
+			walkErr = listWalker(ctx, h.FileSystem, reqPath, depth, walkFn)
+		}
+	} else {
+		walkErr = walkFn(reqPath, fi, nil)
+	}
+
 	closeErr := mw.close()
 	if walkErr != nil {
 		return http.StatusInternalServerError, walkErr
@@ -577,6 +669,51 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 		return http.StatusInternalServerError, closeErr
 	}
 	return 0, nil
+}
+
+// 实现目录递归函数，替代原来的 walkFS
+func listWalker(ctx context.Context, fs FileSystem, name string, depth int, fn func(name string, info FileInfo, err error) error) error {
+	if depth == 0 {
+		return nil
+	}
+
+	// 读取目录内容
+	fileInfos, err := fs.List(ctx, name)
+	if err != nil {
+		return fn(name, nil, err)
+	}
+
+	for _, info := range fileInfos {
+		path := path.Join(name, info.Name())
+		err := fn(path, info, nil)
+		if err != nil {
+			if err == filepath.SkipDir {
+				continue
+			}
+			return err
+		}
+
+		if info.IsDir() && (depth == infiniteDepth || depth > 1) {
+			nextDepth := depth
+			if nextDepth > 0 {
+				nextDepth--
+			}
+			if err := listWalker(ctx, fs, path, nextDepth, fn); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// 为新的 FileInfo 接口提供兼容层，使其能够满足 os.FileInfo 接口
+type compatFileInfo struct {
+	FileInfo
+}
+
+func (c compatFileInfo) Sys() interface{} {
+	return nil
 }
 
 func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (status int, err error) {
@@ -592,12 +729,26 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 
 	ctx := r.Context()
 
-	if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusNotFound, err
+	// 检查文件是否存在
+	fileExists := false
+	if reqPath == "/" {
+		fileExists = true
+	} else {
+		fileInfos, err := h.FileSystem.List(ctx, path.Dir(reqPath))
+		if err == nil {
+			for _, info := range fileInfos {
+				if info.Name() == path.Base(reqPath) {
+					fileExists = true
+					break
+				}
+			}
 		}
-		return http.StatusMethodNotAllowed, err
 	}
+
+	if !fileExists {
+		return http.StatusNotFound, os.ErrNotExist
+	}
+
 	patches, status, err := readProppatch(r.Body)
 	if err != nil {
 		return status, err
@@ -699,6 +850,7 @@ const (
 	StatusLocked              = 423
 	StatusFailedDependency    = 424
 	StatusInsufficientStorage = 507
+	StatusPreconditionFailed  = http.StatusPreconditionFailed
 )
 
 func StatusText(code int) string {
@@ -737,3 +889,195 @@ var (
 	errUnsupportedLockInfo     = errors.New("webdav: unsupported lock info")
 	errUnsupportedMethod       = errors.New("webdav: unsupported method")
 )
+
+// 为了支持重定向的 FileBody 实现
+type requestFileBody struct {
+	io.Reader
+	info FileInfo
+}
+
+func (rb *requestFileBody) Name() string {
+	return rb.info.Name()
+}
+
+func (rb *requestFileBody) Size() int64 {
+	return rb.info.Size()
+}
+
+func (rb *requestFileBody) ModTime() time.Time {
+	return rb.info.ModTime()
+}
+
+func (rb *requestFileBody) Mode() os.FileMode {
+	return rb.info.Mode()
+}
+
+func (rb *requestFileBody) Mime() string {
+	return rb.info.Mime()
+}
+
+func (rb *requestFileBody) IsDir() bool {
+	return rb.info.IsDir()
+}
+
+func (rb *requestFileBody) URL() string {
+	return ""
+}
+
+// 简单的 FileInfo 实现
+type simpleFileInfo struct {
+	name    string
+	size    int64
+	mode    os.FileMode
+	modTime time.Time
+	mime    string
+}
+
+func (fi *simpleFileInfo) Name() string {
+	return fi.name
+}
+
+func (fi *simpleFileInfo) Size() int64 {
+	return fi.size
+}
+
+func (fi *simpleFileInfo) Mode() os.FileMode {
+	return fi.mode
+}
+
+func (fi *simpleFileInfo) ModTime() time.Time {
+	return fi.modTime
+}
+
+func (fi *simpleFileInfo) IsDir() bool {
+	return fi.mode.IsDir()
+}
+
+func (fi *simpleFileInfo) Sys() interface{} {
+	return nil
+}
+
+func (fi *simpleFileInfo) Mime() string {
+	return fi.mime
+}
+
+// moveFiles 函数调整为使用新接口
+func moveFiles(ctx context.Context, fs FileSystem, src, dst string, overwrite bool) (status int, err error) {
+	if overwrite {
+		// 检查目标是否存在，如果存在则先删除
+		dstDir := path.Dir(dst)
+		fileInfos, err := fs.List(ctx, dstDir)
+		if err == nil {
+			for _, info := range fileInfos {
+				if info.Name() == path.Base(dst) {
+					// 目标文件存在，需要删除
+					if err := fs.Remove(ctx, dst); err != nil {
+						return http.StatusForbidden, err
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if err := fs.Rename(ctx, src, dst); err != nil {
+		return http.StatusForbidden, err
+	}
+	return http.StatusNoContent, nil
+}
+
+// copyFiles 函数调整为使用新接口
+func copyFiles(ctx context.Context, fs FileSystem, src, dst string, overwrite bool, depth int, recursion int) (status int, err error) {
+	if recursion == 1000 {
+		return http.StatusInternalServerError, errRecursionTooDeep
+	}
+
+	// 首先检查源文件/目录是否存在
+	srcDir := path.Dir(src)
+	srcBase := path.Base(src)
+	srcExists := false
+
+	fileInfos, err := fs.List(ctx, srcDir)
+	if err != nil {
+		return http.StatusNotFound, err
+	}
+
+	var srcInfo FileInfo
+	for _, info := range fileInfos {
+		if info.Name() == srcBase {
+			srcExists = true
+			srcInfo = info
+			break
+		}
+	}
+
+	if !srcExists {
+		return http.StatusNotFound, os.ErrNotExist
+	}
+
+	// 检查目标是否已存在
+	dstExists := false
+	dstDir := path.Dir(dst)
+	dstBase := path.Base(dst)
+
+	dstInfos, err := fs.List(ctx, dstDir)
+	if err == nil {
+		for _, info := range dstInfos {
+			if info.Name() == dstBase {
+				dstExists = true
+				if !overwrite {
+					return http.StatusPreconditionFailed, os.ErrExist
+				}
+				break
+			}
+		}
+	}
+
+	if dstExists && overwrite {
+		if err := fs.Remove(ctx, dst); err != nil {
+			return http.StatusForbidden, err
+		}
+	}
+
+	if !srcInfo.Mode().IsDir() {
+		// 复制文件
+		return copyFile(ctx, fs, src, dst)
+	} else if depth == 0 {
+		// 创建目录但不复制其内容
+		if err := fs.Mkdir(ctx, dst, srcInfo.Mode()); err != nil {
+			return http.StatusForbidden, err
+		}
+		return http.StatusCreated, nil
+	}
+
+	// 深度复制目录
+	if err := fs.Mkdir(ctx, dst, srcInfo.Mode()); err != nil {
+		return http.StatusConflict, err
+	}
+
+	// 读取源目录内容
+	children, err := fs.List(ctx, src)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+
+	// 递归复制子项
+	for _, child := range children {
+		childSrc := path.Join(src, child.Name())
+		childDst := path.Join(dst, child.Name())
+		st, err := copyFiles(ctx, fs, childSrc, childDst, overwrite, depth, recursion+1)
+		if err != nil {
+			return st, err
+		}
+	}
+
+	return http.StatusCreated, nil
+}
+
+// 辅助函数 - 复制单个文件
+func copyFile(ctx context.Context, fs FileSystem, src, dst string) (status int, err error) {
+	if err := fs.Copy(ctx, src, dst); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	return http.StatusCreated, nil
+}

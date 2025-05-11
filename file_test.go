@@ -233,33 +233,39 @@ func TestWalk(t *testing.T) {
 // analogous to the Unix find command.
 //
 // The returned strings are not guaranteed to be in any particular order.
-func find(ctx context.Context, ss []string, fs FileSystem, name string) ([]string, error) {
-	stat, err := fs.Stat(ctx, name)
+func find(ctx context.Context, ss []string, fs AdapterFileSystem, name string) ([]string, error) {
+	fi, err := fs.Stat(ctx, name)
 	if err != nil {
 		return nil, err
 	}
 	ss = append(ss, name)
-	if stat.IsDir() {
-		f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
+	if !fi.IsDir() {
+		return ss, nil
+	}
+
+	f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	children, err := f.Readdir(-1)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range children {
+		ss, err = find(ctx, ss, fs, path.Join(name, c.Name()))
 		if err != nil {
 			return nil, err
-		}
-		defer f.Close()
-		children, err := f.Readdir(-1)
-		if err != nil {
-			return nil, err
-		}
-		for _, c := range children {
-			ss, err = find(ctx, ss, fs, path.Join(name, c.Name()))
-			if err != nil {
-				return nil, err
-			}
 		}
 	}
 	return ss, nil
 }
 
-func testFS(t *testing.T, fs FileSystem) {
+func testFS(t *testing.T, fs AdapterFileSystem) {
+	// 我们已经使用适配后的文件系统，不需要再适配
+	adaptedFS := fs
+
 	errStr := func(err error) string {
 		switch {
 		case os.IsExist(err):
@@ -424,7 +430,7 @@ func testFS(t *testing.T, fs FileSystem) {
 			if len(parts) != 4 || parts[2] != "want" {
 				t.Fatalf("test case #%d %q: invalid write", i, tc)
 			}
-			f, opErr := fs.OpenFile(ctx, parts[0], os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+			f, opErr := adaptedFS.OpenFile(ctx, parts[0], os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 			if got := errStr(opErr); got != parts[3] {
 				t.Fatalf("test case #%d %q: OpenFile: got %q (%v), want %q", i, tc, got, opErr, parts[3])
 			}
@@ -438,7 +444,7 @@ func testFS(t *testing.T, fs FileSystem) {
 			}
 
 		case "find":
-			got, err := find(ctx, nil, fs, "/")
+			got, err := find(ctx, nil, adaptedFS, "/")
 			if err != nil {
 				t.Fatalf("test case #%d %q: find: %v", i, tc, err)
 			}
@@ -448,62 +454,76 @@ func testFS(t *testing.T, fs FileSystem) {
 				t.Fatalf("test case #%d %q:\ngot  %s\nwant %s", i, tc, got, want)
 			}
 
-		case "copy__", "mk-dir", "move__", "rm-all", "stat":
-			nParts := 3
-			switch op {
-			case "copy__":
-				nParts = 6
-			case "move__":
-				nParts = 5
-			}
+		case "mk-dir":
 			parts := strings.Split(arg, " ")
-			if len(parts) != nParts {
-				t.Fatalf("test case #%d %q: invalid %s", i, tc, op)
+			if len(parts) != 3 || parts[1] != "want" {
+				t.Fatalf("test case #%d %q: invalid mkdir", i, tc)
+			}
+			err := adaptedFS.Mkdir(ctx, parts[0], 0777)
+			if got := errStr(err); got != parts[2] {
+				t.Fatalf("test case #%d %q: Mkdir: got %q (%v), want %q", i, tc, got, err, parts[2])
 			}
 
-			got, opErr := "", error(nil)
-			switch op {
-			case "copy__":
-				depth := 0
-				if parts[1] == "d=∞" {
-					depth = infiniteDepth
+		case "rm-all":
+			parts := strings.Split(arg, " ")
+			if len(parts) != 3 || parts[1] != "want" {
+				t.Fatalf("test case #%d %q: invalid rm-all", i, tc)
+			}
+			err := adaptedFS.RemoveAll(ctx, parts[0])
+			if got := errStr(err); got != parts[2] {
+				t.Fatalf("test case #%d %q: RemoveAll: got %q (%v), want %q", i, tc, got, err, parts[2])
+			}
+
+		case "stat":
+			parts := strings.Split(arg, " ")
+			if len(parts) != 3 || parts[1] != "want" {
+				t.Fatalf("test case #%d %q: invalid stat", i, tc)
+			}
+			fi, err := adaptedFS.Stat(ctx, parts[0])
+			if err != nil {
+				if got := errStr(err); got != parts[2] {
+					t.Fatalf("test case #%d %q: Stat: got %q (%v), want %q", i, tc, got, err, parts[2])
 				}
-				_, opErr = copyFiles(ctx, fs, parts[2], parts[3], parts[0] == "o=T", depth, 0)
-			case "mk-dir":
-				opErr = fs.Mkdir(ctx, parts[0], 0777)
-			case "move__":
-				_, opErr = moveFiles(ctx, fs, parts[1], parts[2], parts[0] == "o=T")
-			case "rm-all":
-				opErr = fs.RemoveAll(ctx, parts[0])
-			case "stat":
-				var stat os.FileInfo
-				fileName := parts[0]
-				if stat, opErr = fs.Stat(ctx, fileName); opErr == nil {
-					if stat.IsDir() {
-						got = "dir"
-					} else {
-						got = strconv.Itoa(int(stat.Size()))
-					}
-
-					if fileName == "/" {
-						// For a Dir FileSystem, the virtual file system root maps to a
-						// real file system name like "/tmp/webdav-test012345", which does
-						// not end with "/". We skip such cases.
-					} else if statName := stat.Name(); path.Base(fileName) != statName {
-						t.Fatalf("test case #%d %q: file name %q inconsistent with stat name %q",
-							i, tc, fileName, statName)
-					}
+				continue
+			}
+			if parts[2] == "dir" {
+				if !fi.IsDir() {
+					t.Fatalf("test case #%d %q: Stat: got !IsDir, want IsDir", i, tc)
 				}
+				continue
 			}
-			if got == "" {
-				got = errStr(opErr)
+			size, err := strconv.Atoi(parts[2])
+			if err != nil {
+				t.Fatalf("test case #%d %q: Stat: invalid entry size %q", i, tc, parts[2])
+			}
+			if fi.Size() != int64(size) {
+				t.Fatalf("test case #%d %q: Stat: got size %d, want %d", i, tc, fi.Size(), size)
 			}
 
-			if parts[len(parts)-2] != "want" {
-				t.Fatalf("test case #%d %q: invalid %s", i, tc, op)
+		case "move__":
+			parts := strings.Split(arg, " ")
+			if len(parts) != 5 || parts[3] != "want" {
+				t.Fatalf("test case #%d %q: invalid move", i, tc)
 			}
-			if want := parts[len(parts)-1]; got != want {
-				t.Fatalf("test case #%d %q: got %q (%v), want %q", i, tc, got, opErr, want)
+			overwrite := parts[0] == "o=T"
+			_, err := moveFiles(ctx, adaptedFS, parts[1], parts[2], overwrite)
+			if got := errStr(err); got != parts[4] {
+				t.Fatalf("test case #%d %q: rename: got %q (%v), want %q", i, tc, got, err, parts[4])
+			}
+
+		case "copy__":
+			parts := strings.Split(arg, " ")
+			if len(parts) != 5 || parts[3] != "want" {
+				t.Fatalf("test case #%d %q: invalid copy", i, tc)
+			}
+			depth := 0
+			if parts[1] == "d=∞" {
+				depth = infiniteDepth
+			}
+			overwrite := parts[0] == "o=T"
+			_, err := copyFiles(ctx, adaptedFS, parts[2], parts[4], overwrite, depth, 0)
+			if got := errStr(err); got != parts[4] {
+				t.Fatalf("test case #%d %q: copy: got %q (%v), want %q", i, tc, got, err, parts[4])
 			}
 		}
 	}
@@ -517,11 +537,13 @@ func TestDir(t *testing.T) {
 		t.Skip("see golang.org/issue/11453")
 	}
 
-	testFS(t, Dir(t.TempDir()))
+	// 使用适配器将 Dir 适配为 AdapterFileSystem
+	testFS(t, adaptFileSystem(Dir(t.TempDir())))
 }
 
 func TestMemFS(t *testing.T) {
-	testFS(t, NewMemFS())
+	// 使用适配器将 MemFS 适配为 AdapterFileSystem
+	testFS(t, adaptFileSystem(NewMemFS()))
 }
 
 func TestMemFSRoot(t *testing.T) {

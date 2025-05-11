@@ -7,12 +7,12 @@ package webdav
 import (
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +27,21 @@ func slashClean(name string) string {
 	return path.Clean(name)
 }
 
+type FileInfo interface {
+	Name() string
+	Size() int64
+	ModTime() time.Time
+	Mode() os.FileMode
+	Mime() string
+	IsDir() bool
+}
+
+type FileBody interface {
+	FileInfo
+	URL() string
+	io.Reader
+}
+
 // A FileSystem implements access to a collection of named files. The elements
 // in a file path are separated by slash ('/', U+002F) characters, regardless
 // of host operating system convention.
@@ -38,11 +53,13 @@ func slashClean(name string) string {
 // might apply". In particular, whether or not renaming a file or directory
 // overwriting another existing file or directory is an error is OS-dependent.
 type FileSystem interface {
-	Mkdir(ctx context.Context, name string, perm os.FileMode) error
-	OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (File, error)
-	RemoveAll(ctx context.Context, name string) error
-	Rename(ctx context.Context, oldName, newName string) error
-	Stat(ctx context.Context, name string) (os.FileInfo, error)
+	List(ctx context.Context, path string) ([]FileInfo, error)
+	Mkdir(ctx context.Context, path string, perm os.FileMode) error
+	Remove(ctx context.Context, path string) error
+	Rename(ctx context.Context, oldPath, newName string) error
+	Copy(ctx context.Context, src, dst string) error
+	Download(ctx context.Context, path string) (FileBody, error)
+	Put(ctx context.Context, path string, file FileBody) error
 }
 
 // A File is returned by a FileSystem's OpenFile method and can be served by a
@@ -78,6 +95,36 @@ func (d Dir) resolve(name string) string {
 	return filepath.Join(dir, filepath.FromSlash(slashClean(name)))
 }
 
+func (d Dir) List(ctx context.Context, name string) ([]FileInfo, error) {
+	if name = d.resolve(name); name == "" {
+		return nil, os.ErrNotExist
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !stat.IsDir() {
+		return nil, os.ErrInvalid
+	}
+
+	infos, err := f.Readdir(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	fileInfos := make([]FileInfo, len(infos))
+	for i, info := range infos {
+		fileInfos[i] = &dirFileInfo{info, ""}
+	}
+	return fileInfos, nil
+}
+
 func (d Dir) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	if name = d.resolve(name); name == "" {
 		return os.ErrNotExist
@@ -85,18 +132,7 @@ func (d Dir) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	return os.Mkdir(name, perm)
 }
 
-func (d Dir) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (File, error) {
-	if name = d.resolve(name); name == "" {
-		return nil, os.ErrNotExist
-	}
-	f, err := os.OpenFile(name, flag, perm)
-	if err != nil {
-		return nil, err
-	}
-	return f, nil
-}
-
-func (d Dir) RemoveAll(ctx context.Context, name string) error {
+func (d Dir) Remove(ctx context.Context, name string) error {
 	if name = d.resolve(name); name == "" {
 		return os.ErrNotExist
 	}
@@ -121,11 +157,163 @@ func (d Dir) Rename(ctx context.Context, oldName, newName string) error {
 	return os.Rename(oldName, newName)
 }
 
-func (d Dir) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+func (d Dir) Copy(ctx context.Context, src, dst string) error {
+	srcPath := d.resolve(src)
+	if srcPath == "" {
+		return os.ErrNotExist
+	}
+
+	dstPath := d.resolve(dst)
+	if dstPath == "" {
+		return os.ErrNotExist
+	}
+
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.IsDir() {
+		return fmt.Errorf("directory copy not supported")
+	}
+
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+func (d Dir) Download(ctx context.Context, name string) (FileBody, error) {
 	if name = d.resolve(name); name == "" {
 		return nil, os.ErrNotExist
 	}
-	return os.Stat(name)
+
+	info, err := os.Stat(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.IsDir() {
+		return nil, os.ErrInvalid
+	}
+
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dirFileBody{file, &dirFileInfo{info, ""}, ""}, nil
+}
+
+func (d Dir) Put(ctx context.Context, name string, file FileBody) error {
+	if name = d.resolve(name); name == "" {
+		return os.ErrNotExist
+	}
+
+	dst, err := os.Create(name)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, file)
+	return err
+}
+
+// 为本地文件系统实现 FileInfo 接口的适配器
+type dirFileInfo struct {
+	os.FileInfo
+	mime string
+}
+
+func (fi *dirFileInfo) Mime() string {
+	if fi.mime == "" {
+		// 可以基于文件扩展名获取 MIME 类型
+		fi.mime = getMimeType(fi.Name())
+	}
+	return fi.mime
+}
+
+// 为本地文件系统实现 FileBody 接口的适配器
+type dirFileBody struct {
+	file *os.File
+	info *dirFileInfo
+	url  string
+}
+
+func (fb *dirFileBody) Name() string {
+	return fb.info.Name()
+}
+
+func (fb *dirFileBody) Size() int64 {
+	return fb.info.Size()
+}
+
+func (fb *dirFileBody) ModTime() time.Time {
+	return fb.info.ModTime()
+}
+
+func (fb *dirFileBody) Mode() os.FileMode {
+	return fb.info.Mode()
+}
+
+func (fb *dirFileBody) Mime() string {
+	return fb.info.Mime()
+}
+
+func (fb *dirFileBody) IsDir() bool {
+	return fb.info.IsDir()
+}
+
+func (fb *dirFileBody) URL() string {
+	return fb.url
+}
+
+func (fb *dirFileBody) Read(p []byte) (n int, err error) {
+	return fb.file.Read(p)
+}
+
+func (fb *dirFileBody) Close() error {
+	return fb.file.Close()
+}
+
+// 简单的 MIME 类型检测函数
+func getMimeType(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".html", ".htm":
+		return "text/html"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".png":
+		return "image/png"
+	case ".pdf":
+		return "application/pdf"
+	case ".txt":
+		return "text/plain"
+	case ".xml":
+		return "application/xml"
+	case ".json":
+		return "application/json"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // NewMemFS returns a new in-memory FileSystem implementation.
@@ -240,6 +428,51 @@ func (fs *memFS) find(op, fullname string) (parent *memFSNode, frag string, err 
 	return parent, frag, err
 }
 
+func (fs *memFS) List(ctx context.Context, name string) ([]FileInfo, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	dir, frag, err := fs.find("list", name)
+	if err != nil {
+		return nil, err
+	}
+
+	var node *memFSNode
+	if dir == nil {
+		// 处理根目录的情况
+		node = &fs.root
+	} else if frag == "" {
+		node = dir
+	} else {
+		node = dir.children[frag]
+		if node == nil {
+			return nil, os.ErrNotExist
+		}
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if !node.mode.IsDir() {
+		return nil, os.ErrInvalid
+	}
+
+	fileInfos := make([]FileInfo, 0, len(node.children))
+	for name, child := range node.children {
+		child.mu.Lock()
+		fileInfos = append(fileInfos, &memFileInfo{
+			name:    name,
+			size:    int64(len(child.data)),
+			mode:    child.mode,
+			modTime: child.modTime,
+			mime:    "",
+		})
+		child.mu.Unlock()
+	}
+
+	return fileInfos, nil
+}
+
 func (fs *memFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -249,81 +482,24 @@ func (fs *memFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error
 		return err
 	}
 	if dir == nil {
-		// We can't create the root.
-		return os.ErrInvalid
+		// We can't create the root directory as it always exists.
+		return os.ErrExist
+	}
+	if frag == "" {
+		return os.ErrExist
 	}
 	if _, ok := dir.children[frag]; ok {
 		return os.ErrExist
 	}
 	dir.children[frag] = &memFSNode{
 		children: make(map[string]*memFSNode),
-		mode:     perm.Perm() | os.ModeDir,
+		mode:     perm | os.ModeDir,
 		modTime:  time.Now(),
 	}
 	return nil
 }
 
-func (fs *memFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (File, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	dir, frag, err := fs.find("open", name)
-	if err != nil {
-		return nil, err
-	}
-	var n *memFSNode
-	if dir == nil {
-		// We're opening the root.
-		if runtime.GOOS == "zos" {
-			if flag&os.O_WRONLY != 0 {
-				return nil, os.ErrPermission
-			}
-		} else {
-			if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
-				return nil, os.ErrPermission
-			}
-		}
-		n, frag = &fs.root, "/"
-
-	} else {
-		n = dir.children[frag]
-		if flag&(os.O_SYNC|os.O_APPEND) != 0 {
-			// memFile doesn't support these flags yet.
-			return nil, os.ErrInvalid
-		}
-		if flag&os.O_CREATE != 0 {
-			if flag&os.O_EXCL != 0 && n != nil {
-				return nil, os.ErrExist
-			}
-			if n == nil {
-				n = &memFSNode{
-					mode: perm.Perm(),
-				}
-				dir.children[frag] = n
-			}
-		}
-		if n == nil {
-			return nil, os.ErrNotExist
-		}
-		if flag&(os.O_WRONLY|os.O_RDWR) != 0 && flag&os.O_TRUNC != 0 {
-			n.mu.Lock()
-			n.data = nil
-			n.mu.Unlock()
-		}
-	}
-
-	children := make([]os.FileInfo, 0, len(n.children))
-	for cName, c := range n.children {
-		children = append(children, c.stat(cName))
-	}
-	return &memFile{
-		n:                n,
-		nameSnapshot:     frag,
-		childrenSnapshot: children,
-	}, nil
-}
-
-func (fs *memFS) RemoveAll(ctx context.Context, name string) error {
+func (fs *memFS) Remove(ctx context.Context, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -331,9 +507,12 @@ func (fs *memFS) RemoveAll(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	if dir == nil {
-		// We can't remove the root.
+	if dir == nil || frag == "" {
+		// We can't remove the root directory.
 		return os.ErrInvalid
+	}
+	if _, ok := dir.children[frag]; !ok {
+		return os.ErrNotExist
 	}
 	delete(dir.children, frag)
 	return nil
@@ -343,69 +522,177 @@ func (fs *memFS) Rename(ctx context.Context, oldName, newName string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	oldName = slashClean(oldName)
-	newName = slashClean(newName)
-	if oldName == newName {
-		return nil
-	}
-	if strings.HasPrefix(newName, oldName+"/") {
-		// We can't rename oldName to be a sub-directory of itself.
-		return os.ErrInvalid
-	}
-
-	oDir, oFrag, err := fs.find("rename", oldName)
+	oldDir, oldFrag, err := fs.find("rename", oldName)
 	if err != nil {
 		return err
 	}
-	if oDir == nil {
-		// We can't rename from the root.
+	if oldDir == nil || oldFrag == "" {
+		// We can't rename the root directory.
 		return os.ErrInvalid
 	}
 
-	nDir, nFrag, err := fs.find("rename", newName)
+	newDir, newFrag, err := fs.find("rename", newName)
 	if err != nil {
 		return err
 	}
-	if nDir == nil {
-		// We can't rename to the root.
+	if newDir == nil || newFrag == "" {
+		// We can't rename to become the root directory.
 		return os.ErrInvalid
 	}
 
-	oNode, ok := oDir.children[oFrag]
-	if !ok {
+	n := oldDir.children[oldFrag]
+	if n == nil {
 		return os.ErrNotExist
 	}
-	if oNode.children != nil {
-		if nNode, ok := nDir.children[nFrag]; ok {
-			if nNode.children == nil {
-				return errNotADirectory
-			}
-			if len(nNode.children) != 0 {
-				return errDirectoryNotEmpty
-			}
-		}
+	if _, ok := newDir.children[newFrag]; ok {
+		return os.ErrExist
 	}
-	delete(oDir.children, oFrag)
-	nDir.children[nFrag] = oNode
+
+	delete(oldDir.children, oldFrag)
+	newDir.children[newFrag] = n
 	return nil
 }
 
-func (fs *memFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
+func (fs *memFS) Copy(ctx context.Context, src, dst string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	dir, frag, err := fs.find("stat", name)
+	srcDir, srcFrag, err := fs.find("copy", src)
+	if err != nil {
+		return err
+	}
+
+	var srcNode *memFSNode
+	if srcDir == nil {
+		if src == "/" {
+			return os.ErrInvalid // 不能复制根目录
+		}
+		return os.ErrNotExist
+	} else if srcFrag == "" {
+		srcNode = srcDir
+	} else {
+		srcNode = srcDir.children[srcFrag]
+		if srcNode == nil {
+			return os.ErrNotExist
+		}
+	}
+
+	srcNode.mu.Lock()
+	defer srcNode.mu.Unlock()
+
+	// 只支持复制文件，不支持目录
+	if srcNode.mode.IsDir() {
+		return fmt.Errorf("directory copy not supported")
+	}
+
+	dstDir, dstFrag, err := fs.find("copy", dst)
+	if err != nil {
+		return err
+	}
+
+	if dstDir == nil || dstFrag == "" {
+		return os.ErrInvalid
+	}
+
+	// 检查目标是否已存在
+	if _, ok := dstDir.children[dstFrag]; ok {
+		return os.ErrExist
+	}
+
+	// 创建新节点并复制数据
+	dstNode := &memFSNode{
+		children: make(map[string]*memFSNode),
+		data:     make([]byte, len(srcNode.data)),
+		mode:     srcNode.mode,
+		modTime:  time.Now(),
+	}
+	copy(dstNode.data, srcNode.data)
+
+	dstDir.children[dstFrag] = dstNode
+	return nil
+}
+
+func (fs *memFS) Download(ctx context.Context, name string) (FileBody, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	dir, frag, err := fs.find("download", name)
 	if err != nil {
 		return nil, err
 	}
+
+	var node *memFSNode
 	if dir == nil {
-		// We're stat'ting the root.
-		return fs.root.stat("/"), nil
+		if name == "/" {
+			return nil, os.ErrInvalid // 根目录不能下载
+		}
+		return nil, os.ErrNotExist
+	} else if frag == "" {
+		node = dir
+	} else {
+		node = dir.children[frag]
+		if node == nil {
+			return nil, os.ErrNotExist
+		}
 	}
-	if n, ok := dir.children[frag]; ok {
-		return n.stat(path.Base(name)), nil
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.mode.IsDir() {
+		return nil, os.ErrInvalid
 	}
-	return nil, os.ErrNotExist
+
+	// 创建一个内存文件体
+	return &memFileBody{
+		node: node,
+		info: &memFileInfo{
+			name:    filepath.Base(name),
+			size:    int64(len(node.data)),
+			mode:    node.mode,
+			modTime: node.modTime,
+			mime:    getMimeType(name),
+		},
+		data: node.data,
+	}, nil
+}
+
+func (fs *memFS) Put(ctx context.Context, name string, file FileBody) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	dir, frag, err := fs.find("put", name)
+	if err != nil {
+		return err
+	}
+
+	if dir == nil || frag == "" {
+		return os.ErrInvalid
+	}
+
+	// 读取所有数据
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return err
+	}
+
+	// 创建或更新节点
+	node, ok := dir.children[frag]
+	if !ok {
+		node = &memFSNode{
+			children: make(map[string]*memFSNode),
+			mode:     0666,
+		}
+		dir.children[frag] = node
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	node.modTime = time.Now()
+	node.data = data
+
+	return nil
 }
 
 // A memFSNode represents a single entry in the in-memory filesystem and also
@@ -470,6 +757,7 @@ type memFileInfo struct {
 	size    int64
 	mode    os.FileMode
 	modTime time.Time
+	mime    string
 }
 
 func (f *memFileInfo) Name() string       { return f.name }
@@ -478,6 +766,12 @@ func (f *memFileInfo) Mode() os.FileMode  { return f.mode }
 func (f *memFileInfo) ModTime() time.Time { return f.modTime }
 func (f *memFileInfo) IsDir() bool        { return f.mode.IsDir() }
 func (f *memFileInfo) Sys() interface{}   { return nil }
+func (f *memFileInfo) Mime() string {
+	if f.mime == "" {
+		f.mime = getMimeType(f.name)
+	}
+	return f.mime
+}
 
 // A memFile is a File implementation for a memFSNode. It is a per-file (not
 // per-node) read/write position, and a snapshot of the memFS' tree structure
@@ -605,34 +899,49 @@ func (f *memFile) Write(p []byte) (int, error) {
 	return lenp, nil
 }
 
-// moveFiles moves files and/or directories from src to dst.
-//
-// See section 9.9.4 for when various HTTP status codes apply.
-func moveFiles(ctx context.Context, fs FileSystem, src, dst string, overwrite bool) (status int, err error) {
-	created := false
-	if _, err := fs.Stat(ctx, dst); err != nil {
-		if !os.IsNotExist(err) {
-			return http.StatusForbidden, err
-		}
-		created = true
-	} else if overwrite {
-		// Section 9.9.3 says that "If a resource exists at the destination
-		// and the Overwrite header is "T", then prior to performing the move,
-		// the server must perform a DELETE with "Depth: infinity" on the
-		// destination resource.
-		if err := fs.RemoveAll(ctx, dst); err != nil {
-			return http.StatusForbidden, err
-		}
-	} else {
-		return http.StatusPreconditionFailed, os.ErrExist
+// 实现 FileBody 接口的内存文件体
+type memFileBody struct {
+	node *memFSNode
+	info *memFileInfo
+	data []byte
+	pos  int
+}
+
+func (f *memFileBody) Name() string {
+	return f.info.Name()
+}
+
+func (f *memFileBody) Size() int64 {
+	return f.info.Size()
+}
+
+func (f *memFileBody) ModTime() time.Time {
+	return f.info.ModTime()
+}
+
+func (f *memFileBody) Mode() os.FileMode {
+	return f.info.Mode()
+}
+
+func (f *memFileBody) Mime() string {
+	return f.info.Mime()
+}
+
+func (f *memFileBody) IsDir() bool {
+	return f.info.IsDir()
+}
+
+func (f *memFileBody) URL() string {
+	return ""
+}
+
+func (f *memFileBody) Read(p []byte) (int, error) {
+	if f.pos >= len(f.data) {
+		return 0, io.EOF
 	}
-	if err := fs.Rename(ctx, src, dst); err != nil {
-		return http.StatusForbidden, err
-	}
-	if created {
-		return http.StatusCreated, nil
-	}
-	return http.StatusNoContent, nil
+	n := copy(p, f.data[f.pos:])
+	f.pos += n
+	return n, nil
 }
 
 func copyProps(dst, src File) error {
@@ -654,150 +963,4 @@ func copyProps(dst, src File) error {
 	}
 	_, err = d.Patch([]Proppatch{{Props: props}})
 	return err
-}
-
-// copyFiles copies files and/or directories from src to dst.
-//
-// See section 9.8.5 for when various HTTP status codes apply.
-func copyFiles(ctx context.Context, fs FileSystem, src, dst string, overwrite bool, depth int, recursion int) (status int, err error) {
-	if recursion == 1000 {
-		return http.StatusInternalServerError, errRecursionTooDeep
-	}
-	recursion++
-
-	// TODO: section 9.8.3 says that "Note that an infinite-depth COPY of /A/
-	// into /A/B/ could lead to infinite recursion if not handled correctly."
-
-	srcFile, err := fs.OpenFile(ctx, src, os.O_RDONLY, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusNotFound, err
-		}
-		return http.StatusInternalServerError, err
-	}
-	defer srcFile.Close()
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusNotFound, err
-		}
-		return http.StatusInternalServerError, err
-	}
-	srcPerm := srcStat.Mode() & os.ModePerm
-
-	created := false
-	if _, err := fs.Stat(ctx, dst); err != nil {
-		if os.IsNotExist(err) {
-			created = true
-		} else {
-			return http.StatusForbidden, err
-		}
-	} else {
-		if !overwrite {
-			return http.StatusPreconditionFailed, os.ErrExist
-		}
-		if err := fs.RemoveAll(ctx, dst); err != nil && !os.IsNotExist(err) {
-			return http.StatusForbidden, err
-		}
-	}
-
-	if srcStat.IsDir() {
-		if err := fs.Mkdir(ctx, dst, srcPerm); err != nil {
-			return http.StatusForbidden, err
-		}
-		if depth == infiniteDepth {
-			children, err := srcFile.Readdir(-1)
-			if err != nil {
-				return http.StatusForbidden, err
-			}
-			for _, c := range children {
-				name := c.Name()
-				s := path.Join(src, name)
-				d := path.Join(dst, name)
-				cStatus, cErr := copyFiles(ctx, fs, s, d, overwrite, depth, recursion)
-				if cErr != nil {
-					// TODO: MultiStatus.
-					return cStatus, cErr
-				}
-			}
-		}
-
-	} else {
-		dstFile, err := fs.OpenFile(ctx, dst, os.O_RDWR|os.O_CREATE|os.O_TRUNC, srcPerm)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return http.StatusConflict, err
-			}
-			return http.StatusForbidden, err
-
-		}
-		_, copyErr := io.Copy(dstFile, srcFile)
-		propsErr := copyProps(dstFile, srcFile)
-		closeErr := dstFile.Close()
-		if copyErr != nil {
-			return http.StatusInternalServerError, copyErr
-		}
-		if propsErr != nil {
-			return http.StatusInternalServerError, propsErr
-		}
-		if closeErr != nil {
-			return http.StatusInternalServerError, closeErr
-		}
-	}
-
-	if created {
-		return http.StatusCreated, nil
-	}
-	return http.StatusNoContent, nil
-}
-
-// walkFS traverses filesystem fs starting at name up to depth levels.
-//
-// Allowed values for depth are 0, 1 or infiniteDepth. For each visited node,
-// walkFS calls walkFn. If a visited file system node is a directory and
-// walkFn returns filepath.SkipDir, walkFS will skip traversal of this node.
-func walkFS(ctx context.Context, fs FileSystem, depth int, name string, info os.FileInfo, walkFn filepath.WalkFunc) error {
-	// This implementation is based on Walk's code in the standard path/filepath package.
-	err := walkFn(name, info, nil)
-	if err != nil {
-		if info.IsDir() && err == filepath.SkipDir {
-			return nil
-		}
-		return err
-	}
-	if !info.IsDir() || depth == 0 {
-		return nil
-	}
-	if depth == 1 {
-		depth = 0
-	}
-
-	// Read directory names.
-	f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
-	if err != nil {
-		return walkFn(name, info, err)
-	}
-	fileInfos, err := f.Readdir(0)
-	f.Close()
-	if err != nil {
-		return walkFn(name, info, err)
-	}
-
-	for _, fileInfo := range fileInfos {
-		filename := path.Join(name, fileInfo.Name())
-		fileInfo, err := fs.Stat(ctx, filename)
-		if err != nil {
-			if err := walkFn(filename, fileInfo, err); err != nil && err != filepath.SkipDir {
-				return err
-			}
-		} else {
-			err = walkFS(ctx, fs, depth, filename, fileInfo, walkFn)
-			if err != nil {
-				if !fileInfo.IsDir() || err != filepath.SkipDir {
-					return err
-				}
-			}
-		}
-	}
-	return nil
 }
