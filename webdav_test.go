@@ -68,8 +68,9 @@ func TestPrefix(t *testing.T) {
 	ctx := context.Background()
 	for _, prefix := range prefixes {
 		fs := NewMemFS()
+		adapter := AdaptFS(fs)
 		h := &Handler{
-			FileSystem: fs,
+			FileSystem: adapter,
 			LockSystem: NewMemLS(),
 		}
 		mux := http.NewServeMux()
@@ -304,6 +305,7 @@ func TestFilenameEscape(t *testing.T) {
 	}}
 	ctx := context.Background()
 	fs := NewMemFS()
+	adapter := AdaptFS(fs)
 	for _, tc := range testCases {
 		if tc.name != "/" {
 			if strings.HasSuffix(tc.name, "/") {
@@ -321,7 +323,7 @@ func TestFilenameEscape(t *testing.T) {
 	}
 
 	srv := httptest.NewServer(&Handler{
-		FileSystem: fs,
+		FileSystem: adapter,
 		LockSystem: NewMemLS(),
 	})
 	defer srv.Close()
@@ -348,8 +350,10 @@ func TestFilenameEscape(t *testing.T) {
 }
 
 func TestPutRequest(t *testing.T) {
+	fs := NewMemFS()
+	adapter := AdaptFS(fs)
 	h := &Handler{
-		FileSystem: NewMemFS(),
+		FileSystem: adapter,
 		LockSystem: NewMemLS(),
 	}
 	srv := httptest.NewServer(h)

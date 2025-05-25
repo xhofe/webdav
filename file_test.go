@@ -1112,7 +1112,7 @@ func TestWalkFS(t *testing.T) {
 			t.Fatalf("%s: cannot create test filesystem: %v", tc.desc, err)
 		}
 		var got []string
-		traceFn := func(path string, info os.FileInfo, err error) error {
+		traceFn := func(path string, info ObjInfo, err error) error {
 			if tc.walkFn != nil {
 				err = tc.walkFn(path, info, err)
 				if err != nil {
@@ -1122,11 +1122,11 @@ func TestWalkFS(t *testing.T) {
 			got = append(got, path)
 			return nil
 		}
-		fi, err := fs.Stat(ctx, tc.startAt)
+		fi, err := fs.Get(ctx, GetReq{Path: tc.startAt, WithContent: false})
 		if err != nil {
 			t.Fatalf("%s: cannot stat: %v", tc.desc, err)
 		}
-		err = walkFS(ctx, fs, tc.depth, tc.startAt, fi, traceFn)
+		err = _walkFS(ctx, fs, tc.depth, tc.startAt, fi, traceFn)
 		if err != nil {
 			t.Errorf("%s:\ngot error %v, want nil", tc.desc, err)
 			continue
@@ -1140,7 +1140,7 @@ func TestWalkFS(t *testing.T) {
 	}
 }
 
-func buildTestFS(buildfs []string) (FileSystem, error) {
+func buildTestFS(buildfs []string) (FSAdapter, error) {
 	// TODO: Could this be merged with the build logic in TestFS?
 
 	ctx := context.Background()
@@ -1173,5 +1173,5 @@ func buildTestFS(buildfs []string) (FileSystem, error) {
 			return nil, fmt.Errorf("unknown file operation %q", op[0])
 		}
 	}
-	return fs, nil
+	return AdaptFS(fs), nil
 }
