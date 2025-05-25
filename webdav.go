@@ -6,9 +6,11 @@
 package webdav // import "golang.org/x/net/webdav"
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +24,8 @@ type Handler struct {
 	// Prefix is the URL path prefix to strip from WebDAV resource paths.
 	Prefix string
 	// FileSystem is the virtual file system.
-	FileSystem FileSystem
+	// FileSystem FileSystem
+	FileSystem FS
 	// LockSystem is the lock management system.
 	LockSystem LockSystem
 	// Logger is an optional error logger. If non-nil, it will be called
@@ -177,7 +180,11 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 	}
 	ctx := r.Context()
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
-	if fi, err := h.FileSystem.Stat(ctx, reqPath); err == nil {
+	// if fi, err := h.FileSystem.Stat(ctx, reqPath); err == nil {
+	if fi, err := h.FileSystem.Get(ctx, GetReq{
+		Path:        reqPath,
+		WithContent: false,
+	}); err == nil {
 		if fi.IsDir() {
 			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
 		} else {
@@ -199,25 +206,38 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	}
 	// TODO: check locks for read-only access??
 	ctx := r.Context()
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
+	// f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
+	f, err := h.FileSystem.Get(ctx, GetReq{
+		Path:        reqPath,
+		WithContent: true,
+	})
 	if err != nil {
 		return http.StatusNotFound, err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return http.StatusNotFound, err
-	}
+	// fi, err := f.Stat()
+	// if err != nil {
+	// 	return http.StatusNotFound, err
+	// }
+	fi := f
 	if fi.IsDir() {
 		return http.StatusMethodNotAllowed, nil
 	}
+
+	// etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, fi)
 	etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, fi)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 	w.Header().Set("ETag", etag)
-	// Let ServeContent determine the Content-Type header.
-	http.ServeContent(w, r, reqPath, fi.ModTime(), f)
+	// Let FS handle the file
+	if err := h.FileSystem.ServeFile(ctx, ServeFileReq{
+		Req:        r,
+		RespWriter: w,
+		File:       f,
+	}); err != nil {
+		return http.StatusInternalServerError, err
+	}
 	return 0, nil
 }
 
@@ -239,13 +259,18 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	// "godoc os RemoveAll" says that "If the path does not exist, RemoveAll
 	// returns nil (no error)." WebDAV semantics are that it should return a
 	// "404 Not Found". We therefore have to Stat before we RemoveAll.
-	if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
+	if _, err := h.FileSystem.Get(ctx, GetReq{
+		Path:        reqPath,
+		WithContent: false,
+	}); err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, err
 		}
 		return http.StatusMethodNotAllowed, err
 	}
-	if err := h.FileSystem.RemoveAll(ctx, reqPath); err != nil {
+	if err := h.FileSystem.RemoveAll(ctx, RemoveReq{
+		Path: reqPath,
+	}); err != nil {
 		return http.StatusMethodNotAllowed, err
 	}
 	return http.StatusNoContent, nil
@@ -265,27 +290,46 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	// comments in http.checkEtag.
 	ctx := r.Context()
 
-	f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return http.StatusConflict, err
-		}
-		return http.StatusNotFound, err
+	// f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	// if err != nil {
+	// 	if os.IsNotExist(err) {
+	// 		return http.StatusConflict, err
+	// 	}
+	// 	return http.StatusNotFound, err
+	// }
+	// _, copyErr := io.Copy(f, r.Body)
+	// fi, statErr := f.Stat()
+	// closeErr := f.Close()
+	// // TODO(rost): Returning 405 Method Not Allowed might not be appropriate.
+	// if copyErr != nil {
+	// 	return http.StatusMethodNotAllowed, copyErr
+	// }
+	// if statErr != nil {
+	// 	return http.StatusMethodNotAllowed, statErr
+	// }
+	// if closeErr != nil {
+	// 	return http.StatusMethodNotAllowed, closeErr
+	// }
+	obj := object{
+		ObjInfo: &objectInfo{
+			mime:      r.Header.Get(http.CanonicalHeaderKey("Content-Type")),
+			createdAt: h.getCreateTime(r),
+			isDir:     false,
+			size:      r.ContentLength,
+			modTime:   h.getModTime(r),
+			mode:      0666,
+			name:      path.Base(reqPath),
+		},
+		url:        reqPath,
+		ReadCloser: r.Body,
 	}
-	_, copyErr := io.Copy(f, r.Body)
-	fi, statErr := f.Stat()
-	closeErr := f.Close()
-	// TODO(rost): Returning 405 Method Not Allowed might not be appropriate.
-	if copyErr != nil {
-		return http.StatusMethodNotAllowed, copyErr
+	if err := h.FileSystem.Put(ctx, PutReq{
+		Path: reqPath,
+		File: &obj,
+	}); err != nil {
+		return http.StatusInternalServerError, err
 	}
-	if statErr != nil {
-		return http.StatusMethodNotAllowed, statErr
-	}
-	if closeErr != nil {
-		return http.StatusMethodNotAllowed, closeErr
-	}
-	etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, fi)
+	etag, err := findETag(ctx, h.FileSystem, h.LockSystem, reqPath, &obj)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
@@ -309,7 +353,10 @@ func (h *Handler) handleMkcol(w http.ResponseWriter, r *http.Request) (status in
 	if r.ContentLength > 0 {
 		return http.StatusUnsupportedMediaType, nil
 	}
-	if err := h.FileSystem.Mkdir(ctx, reqPath, 0777); err != nil {
+	if err := h.FileSystem.MkdirAll(ctx, MkdirReq{
+		DirPath: reqPath,
+		Mode:    0777,
+	}); err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusConflict, err
 		}
@@ -373,7 +420,8 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 				return http.StatusBadRequest, errInvalidDepth
 			}
 		}
-		return copyFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") != "F", depth, 0)
+		// return copyFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") != "F", depth, 0)
+		return _copyFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") != "F", depth)
 	}
 
 	release, status, err := h.confirmLocks(r, src, dst)
@@ -390,7 +438,8 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) (status
 			return http.StatusBadRequest, errInvalidDepth
 		}
 	}
-	return moveFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") == "T")
+	// return moveFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") == "T")
+	return _moveFiles(ctx, h.FileSystem, src, dst, r.Header.Get("Overwrite") == "T")
 }
 
 func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus int, retErr error) {
@@ -461,14 +510,41 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 		}()
 
 		// Create the resource if it didn't previously exist.
-		if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
-			f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-			if err != nil {
-				// TODO: detect missing intermediate dirs and return http.StatusConflict?
+		if _, err := h.FileSystem.Get(ctx, GetReq{
+			Path: reqPath,
+		}); err != nil {
+			// f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+			// if err != nil {
+			// 	// TODO: detect missing intermediate dirs and return http.StatusConflict?
+			// 	return http.StatusInternalServerError, err
+			// }
+			// f.Close()
+			if os.IsNotExist(err) {
+				// create the resource
+				obj := object{
+					ObjInfo: &objectInfo{
+						mime:      mime.TypeByExtension(path.Ext(reqPath)),
+						createdAt: time.Now(),
+						isDir:     false,
+						size:      0,
+						modTime:   time.Now(),
+						mode:      0666,
+						name:      path.Base(reqPath),
+					},
+					url: reqPath,
+					// give an empty reader
+					ReadCloser: io.NopCloser(bytes.NewReader([]byte{})),
+				}
+				if err := h.FileSystem.Put(ctx, PutReq{
+					Path: reqPath,
+					File: &obj,
+				}); err != nil {
+					return http.StatusInternalServerError, err
+				}
+				created = true
+			} else {
 				return http.StatusInternalServerError, err
 			}
-			f.Close()
-			created = true
 		}
 
 		// http://www.webdav.org/specs/rfc4918.html#HEADER_Lock-Token says that the
@@ -516,7 +592,10 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 		return status, err
 	}
 	ctx := r.Context()
-	fi, err := h.FileSystem.Stat(ctx, reqPath)
+	fi, err := h.FileSystem.Get(ctx, GetReq{
+		Path:        reqPath,
+		WithContent: false,
+	})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, err
@@ -537,14 +616,15 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 
 	mw := multistatusWriter{w: w}
 
-	walkFn := func(reqPath string, info os.FileInfo, err error) error {
+	walkFn := func(reqPath string, info ObjInfo, err error) error {
 		if err != nil {
 			return handlePropfindError(err, info)
 		}
 
 		var pstats []Propstat
 		if pf.Propname != nil {
-			pnames, err := propnames(ctx, h.FileSystem, h.LockSystem, reqPath)
+			// pnames, err := propnames(ctx, h.FileSystem, h.LockSystem, reqPath)
+			pnames, err := propnames(ctx, h.FileSystem, h.LockSystem, info)
 			if err != nil {
 				return handlePropfindError(err, info)
 			}
@@ -554,9 +634,11 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 			}
 			pstats = append(pstats, pstat)
 		} else if pf.Allprop != nil {
-			pstats, err = allprop(ctx, h.FileSystem, h.LockSystem, reqPath, pf.Prop)
+			// pstats, err = allprop(ctx, h.FileSystem, h.LockSystem, reqPath, pf.Prop)
+			pstats, err = allprop(ctx, h.FileSystem, h.LockSystem, reqPath, info, pf.Prop)
 		} else {
-			pstats, err = props(ctx, h.FileSystem, h.LockSystem, reqPath, pf.Prop)
+			// pstats, err = props(ctx, h.FileSystem, h.LockSystem, reqPath, pf.Prop)
+			pstats, err = props(ctx, h.FileSystem, h.LockSystem, reqPath, info, pf.Prop)
 		}
 		if err != nil {
 			return handlePropfindError(err, info)
@@ -568,7 +650,8 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 		return mw.write(makePropstatResponse(href, pstats))
 	}
 
-	walkErr := walkFS(ctx, h.FileSystem, depth, reqPath, fi, walkFn)
+	// walkErr := walkFS(ctx, h.FileSystem, depth, reqPath, fi, walkFn)
+	walkErr := _walkFS(ctx, h.FileSystem, depth, reqPath, fi, walkFn)
 	closeErr := mw.close()
 	if walkErr != nil {
 		return http.StatusInternalServerError, walkErr
@@ -592,7 +675,10 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 
 	ctx := r.Context()
 
-	if _, err := h.FileSystem.Stat(ctx, reqPath); err != nil {
+	fi, err := h.FileSystem.Get(ctx, GetReq{
+		Path: reqPath,
+	})
+	if err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, err
 		}
@@ -602,7 +688,7 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) (statu
 	if err != nil {
 		return status, err
 	}
-	pstats, err := patch(ctx, h.FileSystem, h.LockSystem, reqPath, patches)
+	pstats, err := patch(ctx, h.FileSystem, h.LockSystem, reqPath, fi, patches)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
