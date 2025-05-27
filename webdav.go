@@ -310,9 +310,21 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	// if closeErr != nil {
 	// 	return http.StatusMethodNotAllowed, closeErr
 	// }
+	// check if put empty segment or root
+	if reqPath == "" || reqPath == "/" {
+		return http.StatusNotFound, errors.New("invalid request")
+	}
+	// check if parent dir exists
+	dir := path.Dir(reqPath)
+	if _, err := h.FileSystem.Get(ctx, GetReq{Path: dir, WithContent: false}); err != nil {
+		if os.IsNotExist(err) {
+			return http.StatusConflict, err
+		}
+		return http.StatusNotFound, err
+	}
 	obj := object{
 		ObjInfo: &objectInfo{
-			mime:      r.Header.Get(http.CanonicalHeaderKey("Content-Type")),
+			mime:      r.Header.Get("Content-Type"),
 			createdAt: h.getCreateTime(r),
 			isDir:     false,
 			size:      r.ContentLength,
