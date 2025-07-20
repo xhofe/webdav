@@ -24,7 +24,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"golang.org/x/net/webdav"
+	"gopkg.in/xhofe/webdav.v0"
 )
 
 var port = flag.Int("port", 9999, "server port")
@@ -33,7 +33,7 @@ func main() {
 	flag.Parse()
 	log.SetFlags(0)
 	h := &webdav.Handler{
-		FileSystem: webdav.NewMemFS(),
+		FileSystem: webdav.AdaptFS(webdav.NewMemFS()),
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			litmus := r.Header.Get("X-Litmus")

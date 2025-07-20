@@ -20,8 +20,8 @@ func TestMemPS(t *testing.T) {
 	ctx := context.Background()
 	// calcProps calculates the getlastmodified and getetag DAV: property
 	// values in pstats for resource name in file-system fs.
-	calcProps := func(name string, fs FileSystem, ls LockSystem, pstats []Propstat) error {
-		fi, err := fs.Stat(ctx, name)
+	calcProps := func(name string, fs FS, ls LockSystem, pstats []Propstat) error {
+		fi, err := fs.Get(ctx, GetReq{Path: name, WithContent: false})
 		if err != nil {
 			return err
 		}
@@ -509,7 +509,7 @@ func TestMemPS(t *testing.T) {
 			t.Fatalf("%s: cannot create test filesystem: %v", tc.desc, err)
 		}
 		if tc.noDeadProps {
-			fs = noDeadPropsFS{fs}
+			fs = AdaptFS(noDeadPropsFS{fs.RawFS()})
 		}
 		ls := NewMemLS()
 		for _, op := range tc.propOp {
@@ -518,11 +518,17 @@ func TestMemPS(t *testing.T) {
 				t.Fatalf("%s: calcProps: %v", desc, err)
 			}
 
+			fi, err := fs.Get(ctx, GetReq{Path: op.name, WithContent: false})
+			if err != nil {
+				t.Errorf("%s: cannot get file info: %v", desc, err)
+				continue
+			}
+
 			// Call property system.
 			var propstats []Propstat
 			switch op.op {
 			case "propname":
-				pnames, err := propnames(ctx, fs, ls, op.name)
+				pnames, err := propnames(ctx, fs, ls, fi)
 				if err != nil {
 					t.Errorf("%s: got error %v, want nil", desc, err)
 					continue
@@ -534,11 +540,11 @@ func TestMemPS(t *testing.T) {
 				}
 				continue
 			case "allprop":
-				propstats, err = allprop(ctx, fs, ls, op.name, op.pnames)
+				propstats, err = allprop(ctx, fs, ls, op.name, fi, op.pnames)
 			case "propfind":
-				propstats, err = props(ctx, fs, ls, op.name, op.pnames)
+				propstats, err = props(ctx, fs, ls, op.name, fi, op.pnames)
 			case "proppatch":
-				propstats, err = patch(ctx, fs, ls, op.name, op.patches)
+				propstats, err = patch(ctx, fs, ls, op.name, fi, op.patches)
 			default:
 				t.Fatalf("%s: %s not implemented", desc, op.op)
 			}
@@ -613,7 +619,7 @@ func (f noDeadPropsFile) Stat() (os.FileInfo, error)                { return f.f
 func (f noDeadPropsFile) Write(p []byte) (int, error)               { return f.f.Write(p) }
 
 type overrideContentType struct {
-	os.FileInfo
+	ObjInfo
 	contentType string
 	err         error
 }
@@ -628,7 +634,7 @@ func TestFindContentTypeOverride(t *testing.T) {
 		t.Fatalf("cannot create test filesystem: %v", err)
 	}
 	ctx := context.Background()
-	fi, err := fs.Stat(ctx, "/file")
+	fi, err := fs.Get(ctx, GetReq{Path: "/file", WithContent: false})
 	if err != nil {
 		t.Fatalf("cannot Stat /file: %v", err)
 	}
@@ -664,7 +670,7 @@ func TestFindContentTypeOverride(t *testing.T) {
 }
 
 type overrideETag struct {
-	os.FileInfo
+	ObjInfo
 	eTag string
 	err  error
 }
@@ -679,7 +685,7 @@ func TestFindETagOverride(t *testing.T) {
 		t.Fatalf("cannot create test filesystem: %v", err)
 	}
 	ctx := context.Background()
-	fi, err := fs.Stat(ctx, "/file")
+	fi, err := fs.Get(ctx, GetReq{Path: "/file", WithContent: false})
 	if err != nil {
 		t.Fatalf("cannot Stat /file: %v", err)
 	}
