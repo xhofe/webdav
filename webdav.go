@@ -182,8 +182,7 @@ func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) (status 
 	allow := "OPTIONS, LOCK, PUT, MKCOL"
 	// if fi, err := h.FileSystem.Stat(ctx, reqPath); err == nil {
 	if fi, err := h.FileSystem.Get(ctx, GetReq{
-		Path:        reqPath,
-		WithContent: false,
+		Path: reqPath,
 	}); err == nil {
 		if fi.IsDir() {
 			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
@@ -208,13 +207,11 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	ctx := r.Context()
 	// f, err := h.FileSystem.OpenFile(ctx, reqPath, os.O_RDONLY, 0)
 	f, err := h.FileSystem.Get(ctx, GetReq{
-		Path:        reqPath,
-		WithContent: true,
+		Path: reqPath,
 	})
 	if err != nil {
 		return http.StatusNotFound, err
 	}
-	defer f.Close()
 	// fi, err := f.Stat()
 	// if err != nil {
 	// 	return http.StatusNotFound, err
@@ -260,8 +257,7 @@ func (h *Handler) handleDelete(w http.ResponseWriter, r *http.Request) (status i
 	// returns nil (no error)." WebDAV semantics are that it should return a
 	// "404 Not Found". We therefore have to Stat before we RemoveAll.
 	if _, err := h.FileSystem.Get(ctx, GetReq{
-		Path:        reqPath,
-		WithContent: false,
+		Path: reqPath,
 	}); err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusNotFound, err
@@ -316,28 +312,25 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 	}
 	// check if parent dir exists
 	dir := path.Dir(reqPath)
-	if _, err := h.FileSystem.Get(ctx, GetReq{Path: dir, WithContent: false}); err != nil {
+	if _, err := h.FileSystem.Get(ctx, GetReq{Path: dir}); err != nil {
 		if os.IsNotExist(err) {
 			return http.StatusConflict, err
 		}
 		return http.StatusNotFound, err
 	}
 	obj := object{
-		ObjInfo: &objectInfo{
-			mime:      r.Header.Get("Content-Type"),
-			createdAt: h.getCreateTime(r),
-			isDir:     false,
-			size:      r.ContentLength,
-			modTime:   h.getModTime(r),
-			mode:      0666,
-			name:      path.Base(reqPath),
-		},
-		url:        reqPath,
-		ReadCloser: r.Body,
+		mime:      r.Header.Get("Content-Type"),
+		createdAt: h.getCreateTime(r),
+		isDir:     false,
+		size:      r.ContentLength,
+		modTime:   h.getModTime(r),
+		mode:      0666,
+		name:      path.Base(reqPath),
 	}
 	if err := h.FileSystem.Put(ctx, PutReq{
-		Path: reqPath,
-		File: &obj,
+		Path:    reqPath,
+		File:    &obj,
+		Content: r.Body,
 	}); err != nil {
 		return http.StatusInternalServerError, err
 	}
@@ -534,22 +527,19 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) (retStatus 
 			if os.IsNotExist(err) {
 				// create the resource
 				obj := object{
-					ObjInfo: &objectInfo{
-						mime:      mime.TypeByExtension(path.Ext(reqPath)),
-						createdAt: time.Now(),
-						isDir:     false,
-						size:      0,
-						modTime:   time.Now(),
-						mode:      0666,
-						name:      path.Base(reqPath),
-					},
-					url: reqPath,
-					// give an empty reader
-					ReadCloser: io.NopCloser(bytes.NewReader([]byte{})),
+					mime:      mime.TypeByExtension(path.Ext(reqPath)),
+					createdAt: time.Now(),
+					isDir:     false,
+					size:      0,
+					modTime:   time.Now(),
+					mode:      0666,
+					name:      path.Base(reqPath),
 				}
 				if err := h.FileSystem.Put(ctx, PutReq{
-					Path: reqPath,
-					File: &obj,
+					Path:    reqPath,
+					File:    &obj,
+					Content: io.NopCloser(bytes.NewReader([]byte{})),
+					IsLock:  true,
 				}); err != nil {
 					return http.StatusInternalServerError, err
 				}
@@ -605,8 +595,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 	}
 	ctx := r.Context()
 	fi, err := h.FileSystem.Get(ctx, GetReq{
-		Path:        reqPath,
-		WithContent: false,
+		Path: reqPath,
 	})
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -628,7 +617,7 @@ func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) (status
 
 	mw := multistatusWriter{w: w}
 
-	walkFn := func(reqPath string, info ObjInfo, err error) error {
+	walkFn := func(reqPath string, info Obj, err error) error {
 		if err != nil {
 			return handlePropfindError(err, info)
 		}

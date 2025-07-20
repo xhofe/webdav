@@ -2,13 +2,13 @@ package webdav
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"os"
 )
 
 type GetReq struct {
-	Path        string
-	WithContent bool
+	Path string
 }
 
 type ListReq struct {
@@ -37,19 +37,22 @@ type CopyMoveReq struct {
 }
 
 type PutReq struct {
-	Path string
-	File Obj
+	Path    string
+	File    Obj
+	Content io.Reader
+	IsLock  bool
 }
 
 type ServeFileReq struct {
 	Req        *http.Request
 	RespWriter http.ResponseWriter
 	File       Obj
+	Path       string
 }
 
 type FS interface {
 	Get(ctx context.Context, req GetReq) (Obj, error)
-	List(ctx context.Context, req ListReq) ([]ObjInfo, error)
+	List(ctx context.Context, req ListReq) ([]Obj, error)
 	MkdirAll(ctx context.Context, req MkdirReq) error
 	RemoveAll(ctx context.Context, req RemoveReq) error
 	Rename(ctx context.Context, req RenameReq) error

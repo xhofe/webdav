@@ -26,8 +26,8 @@ func (f *fsAdapter) Get(ctx context.Context, req GetReq) (Obj, error) {
 		return nil, err
 	}
 
-	// Create ObjInfo
-	objInfo := &objectInfo{
+	// Create Obj
+	o := &object{
 		name:      path.Base(req.Path),
 		size:      fileInfo.Size(),
 		mode:      fileInfo.Mode(),
@@ -37,30 +37,11 @@ func (f *fsAdapter) Get(ctx context.Context, req GetReq) (Obj, error) {
 		mime:      f.getMimeType(req.Path, fileInfo),
 	}
 
-	if !req.WithContent {
-		// Only return info, no content
-		return &object{
-			ObjInfo:    objInfo,
-			ReadCloser: nil,
-			url:        req.Path,
-		}, nil
-	}
-
-	// Need content, open file
-	file, err := f.fs.OpenFile(ctx, req.Path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	return &object{
-		ObjInfo:    objInfo,
-		ReadCloser: file,
-		url:        req.Path,
-	}, nil
+	return o, nil
 }
 
 // List implements FS.
-func (f *fsAdapter) List(ctx context.Context, req ListReq) ([]ObjInfo, error) {
+func (f *fsAdapter) List(ctx context.Context, req ListReq) ([]Obj, error) {
 	// Open directory
 	file, err := f.fs.OpenFile(ctx, req.DirPath, os.O_RDONLY, 0)
 	if err != nil {
@@ -75,10 +56,10 @@ func (f *fsAdapter) List(ctx context.Context, req ListReq) ([]ObjInfo, error) {
 	}
 
 	// Convert to ObjInfo list
-	objInfos := make([]ObjInfo, len(fileInfos))
+	objInfos := make([]Obj, len(fileInfos))
 	for i, fi := range fileInfos {
 		childPath := path.Join(req.DirPath, fi.Name())
-		objInfos[i] = &objectInfo{
+		objInfos[i] = &object{
 			name:      fi.Name(),
 			size:      fi.Size(),
 			mode:      fi.Mode(),
@@ -131,7 +112,7 @@ func (f *fsAdapter) Put(ctx context.Context, req PutReq) error {
 	defer file.Close()
 
 	// Copy content
-	_, err = io.Copy(file, req.File)
+	_, err = io.Copy(file, req.Content)
 	if err != nil {
 		return err
 	}
@@ -150,7 +131,13 @@ func (f *fsAdapter) ServeFile(ctx context.Context, req ServeFileReq) error {
 
 	// If not supported Seek, copy content directly
 	req.RespWriter.Header().Set("Content-Type", req.File.Mime())
-	_, err := io.Copy(req.RespWriter, req.File)
+	file, err := f.fs.OpenFile(ctx, req.Path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(req.RespWriter, file)
 	return err
 }
 

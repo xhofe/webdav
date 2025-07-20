@@ -21,7 +21,7 @@ func TestMemPS(t *testing.T) {
 	// calcProps calculates the getlastmodified and getetag DAV: property
 	// values in pstats for resource name in file-system fs.
 	calcProps := func(name string, fs FS, ls LockSystem, pstats []Propstat) error {
-		fi, err := fs.Get(ctx, GetReq{Path: name, WithContent: false})
+		fi, err := fs.Get(ctx, GetReq{Path: name})
 		if err != nil {
 			return err
 		}
@@ -518,7 +518,7 @@ func TestMemPS(t *testing.T) {
 				t.Fatalf("%s: calcProps: %v", desc, err)
 			}
 
-			fi, err := fs.Get(ctx, GetReq{Path: op.name, WithContent: false})
+			fi, err := fs.Get(ctx, GetReq{Path: op.name})
 			if err != nil {
 				t.Errorf("%s: cannot get file info: %v", desc, err)
 				continue
@@ -619,7 +619,7 @@ func (f noDeadPropsFile) Stat() (os.FileInfo, error)                { return f.f
 func (f noDeadPropsFile) Write(p []byte) (int, error)               { return f.f.Write(p) }
 
 type overrideContentType struct {
-	ObjInfo
+	Obj
 	contentType string
 	err         error
 }
@@ -634,7 +634,7 @@ func TestFindContentTypeOverride(t *testing.T) {
 		t.Fatalf("cannot create test filesystem: %v", err)
 	}
 	ctx := context.Background()
-	fi, err := fs.Get(ctx, GetReq{Path: "/file", WithContent: false})
+	fi, err := fs.Get(ctx, GetReq{Path: "/file"})
 	if err != nil {
 		t.Fatalf("cannot Stat /file: %v", err)
 	}
@@ -670,7 +670,7 @@ func TestFindContentTypeOverride(t *testing.T) {
 }
 
 type overrideETag struct {
-	ObjInfo
+	Obj
 	eTag string
 	err  error
 }
@@ -685,7 +685,7 @@ func TestFindETagOverride(t *testing.T) {
 		t.Fatalf("cannot create test filesystem: %v", err)
 	}
 	ctx := context.Background()
-	fi, err := fs.Get(ctx, GetReq{Path: "/file", WithContent: false})
+	fi, err := fs.Get(ctx, GetReq{Path: "/file"})
 	if err != nil {
 		t.Fatalf("cannot Stat /file: %v", err)
 	}

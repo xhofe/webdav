@@ -1,24 +1,17 @@
 package webdav
 
 import (
-	"io"
 	"io/fs"
 	"time"
 )
 
-type ObjInfo interface {
+type Obj interface {
 	fs.FileInfo
 	Mime() string
 	CreatedAt() time.Time
 }
 
-type Obj interface {
-	ObjInfo
-	URL() string
-	io.ReadCloser
-}
-
-type objectInfo struct {
+type object struct {
 	mime      string
 	createdAt time.Time
 	isDir     bool
@@ -29,56 +22,43 @@ type objectInfo struct {
 }
 
 // CreatedAt implements ObjInfo.
-func (o *objectInfo) CreatedAt() time.Time {
+func (o *object) CreatedAt() time.Time {
 	return o.createdAt
 }
 
 // IsDir implements ObjInfo.
-func (o *objectInfo) IsDir() bool {
+func (o *object) IsDir() bool {
 	return o.isDir
 }
 
 // Mime implements ObjInfo.
-func (o *objectInfo) Mime() string {
+func (o *object) Mime() string {
 	return o.mime
 }
 
 // ModTime implements ObjInfo.
-func (o *objectInfo) ModTime() time.Time {
+func (o *object) ModTime() time.Time {
 	return o.modTime
 }
 
 // Mode implements ObjInfo.
-func (o *objectInfo) Mode() fs.FileMode {
+func (o *object) Mode() fs.FileMode {
 	return o.mode
 }
 
 // Name implements ObjInfo.
-func (o *objectInfo) Name() string {
+func (o *object) Name() string {
 	return o.name
 }
 
 // Size implements ObjInfo.
-func (o *objectInfo) Size() int64 {
+func (o *object) Size() int64 {
 	return o.size
 }
 
 // Sys implements ObjInfo.
-func (o *objectInfo) Sys() any {
+func (o *object) Sys() any {
 	return nil
-}
-
-var _ ObjInfo = &objectInfo{}
-
-type object struct {
-	ObjInfo
-	io.ReadCloser
-	url string
-}
-
-// URL implements Obj.
-func (o *object) URL() string {
-	return o.url
 }
 
 var _ Obj = &object{}

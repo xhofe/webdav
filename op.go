@@ -11,8 +11,7 @@ import (
 func _copyFiles(ctx context.Context, fs FS, src, dst string, overwrite bool, depth int) (status int, err error) {
 	// check if src exists
 	srcObj, err := fs.Get(ctx, GetReq{
-		Path:        src,
-		WithContent: false,
+		Path: src,
 	})
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -23,8 +22,7 @@ func _copyFiles(ctx context.Context, fs FS, src, dst string, overwrite bool, dep
 	created := false
 	// check if dst exists
 	if _, err = fs.Get(ctx, GetReq{
-		Path:        dst,
-		WithContent: false,
+		Path: dst,
 	}); err != nil {
 		if os.IsNotExist(err) {
 			created = true
@@ -64,8 +62,7 @@ func _copyFiles(ctx context.Context, fs FS, src, dst string, overwrite bool, dep
 func _moveFiles(ctx context.Context, fs FS, src, dst string, overwrite bool) (status int, err error) {
 	created := false
 	if _, err := fs.Get(ctx, GetReq{
-		Path:        dst,
-		WithContent: false,
+		Path: dst,
 	}); err != nil {
 		if !os.IsNotExist(err) {
 			return http.StatusForbidden, err
@@ -94,9 +91,9 @@ func _moveFiles(ctx context.Context, fs FS, src, dst string, overwrite bool) (st
 	return http.StatusNoContent, nil
 }
 
-type walkFn func(reqPath string, info ObjInfo, err error) error
+type walkFn func(reqPath string, info Obj, err error) error
 
-func _walkFS(ctx context.Context, fs FS, depth int, name string, info ObjInfo, walkFn walkFn) error {
+func _walkFS(ctx context.Context, fs FS, depth int, name string, info Obj, walkFn walkFn) error {
 	// This implementation is based on Walk's code in the standard path/filepath package.
 	err := walkFn(name, info, nil)
 	if err != nil {

@@ -1112,7 +1112,7 @@ func TestWalkFS(t *testing.T) {
 			t.Fatalf("%s: cannot create test filesystem: %v", tc.desc, err)
 		}
 		var got []string
-		traceFn := func(path string, info ObjInfo, err error) error {
+		traceFn := func(path string, info Obj, err error) error {
 			if tc.walkFn != nil {
 				err = tc.walkFn(path, info, err)
 				if err != nil {
@@ -1122,7 +1122,7 @@ func TestWalkFS(t *testing.T) {
 			got = append(got, path)
 			return nil
 		}
-		fi, err := fs.Get(ctx, GetReq{Path: tc.startAt, WithContent: false})
+		fi, err := fs.Get(ctx, GetReq{Path: tc.startAt})
 		if err != nil {
 			t.Fatalf("%s: cannot stat: %v", tc.desc, err)
 		}
