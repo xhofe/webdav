@@ -3,10 +3,12 @@ package webdav
 import (
 	"context"
 	"io"
+	"io/fs"
 	"mime"
 	"net/http"
 	"os"
 	"path"
+	"time"
 )
 
 type FSAdapter interface {
@@ -21,7 +23,16 @@ type fsAdapter struct {
 // Get implements FS.
 func (f *fsAdapter) Get(ctx context.Context, req GetReq) (Obj, error) {
 	// Get file info
-	fileInfo, err := f.fs.Stat(ctx, req.Path)
+	fi, err := f.fs.OpenFile(ctx, req.Path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if mem, ok := fi.(*memFile); ok {
+		return mem, nil
+	}
+
+	fileInfo, err := fi.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -59,6 +70,10 @@ func (f *fsAdapter) List(ctx context.Context, req ListReq) ([]Obj, error) {
 	objInfos := make([]Obj, len(fileInfos))
 	for i, fi := range fileInfos {
 		childPath := path.Join(req.DirPath, fi.Name())
+		if mem, ok := fi.(*memFile); ok {
+			objInfos[i] = mem
+			continue
+		}
 		objInfos[i] = &object{
 			name:      fi.Name(),
 			size:      fi.Size(),
@@ -166,3 +181,54 @@ func (f *fsAdapter) RawFS() FileSystem {
 func AdaptFS(fs FileSystem) FSAdapter {
 	return &fsAdapter{fs: fs}
 }
+
+// CreatedAt implements Obj.
+func (f *memFile) CreatedAt() time.Time {
+	return f.n.modTime
+}
+
+// IsDir implements Obj.
+func (f *memFile) IsDir() bool {
+	return f.n.mode.IsDir()
+}
+
+// Mime implements Obj.
+func (f *memFile) Mime() string {
+	// Read a chunk to decide between utf-8 text and binary.
+	var buf [512]byte
+	n, err := io.ReadFull(f, buf[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return ""
+	}
+	ctype := http.DetectContentType(buf[:n])
+	// Rewind file.
+	_, _ = f.Seek(0, io.SeekStart)
+	return ctype
+}
+
+// ModTime implements Obj.
+func (f *memFile) ModTime() time.Time {
+	return f.n.modTime
+}
+
+// Mode implements Obj.
+func (f *memFile) Mode() fs.FileMode {
+	return f.n.mode
+}
+
+// Name implements Obj.
+func (f *memFile) Name() string {
+	return f.nameSnapshot
+}
+
+// Size implements Obj.
+func (f *memFile) Size() int64 {
+	return int64(len(f.n.data))
+}
+
+// Sys implements Obj.
+func (f *memFile) Sys() any {
+	return nil
+}
+
+var _ Obj = (*memFile)(nil)
