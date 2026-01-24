@@ -39,7 +39,7 @@ type CopyMoveReq struct {
 type PutReq struct {
 	Path    string
 	File    Obj
-	Content io.Reader
+	Content io.ReadCloser
 	IsLock  bool
 }
 
