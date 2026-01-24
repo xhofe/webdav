@@ -232,6 +232,7 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 		Req:        r,
 		RespWriter: w,
 		File:       f,
+		Path:       reqPath,
 	}); err != nil {
 		return http.StatusInternalServerError, err
 	}
