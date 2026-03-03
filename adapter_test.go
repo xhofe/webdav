@@ -98,11 +98,6 @@ func (f *fsAdapter) RemoveAll(ctx context.Context, req RemoveReq) error {
 	return f.fs.RemoveAll(ctx, req.Path)
 }
 
-// Rename implements FS.
-func (f *fsAdapter) Rename(ctx context.Context, req RenameReq) error {
-	return f.fs.Rename(ctx, req.OldPath, req.NewPath)
-}
-
 // CopyAll implements FS.
 func (f *fsAdapter) CopyAll(ctx context.Context, req CopyMoveReq) error {
 	// Use copyFiles function in file.go

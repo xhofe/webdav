@@ -24,11 +24,6 @@ type RemoveReq struct {
 	Path string
 }
 
-type RenameReq struct {
-	OldPath string
-	NewPath string
-}
-
 type CopyMoveReq struct {
 	SrcPath   string
 	DstPath   string
@@ -55,7 +50,6 @@ type FS interface {
 	List(ctx context.Context, req ListReq) ([]Obj, error)
 	MkdirAll(ctx context.Context, req MkdirReq) error
 	RemoveAll(ctx context.Context, req RemoveReq) error
-	Rename(ctx context.Context, req RenameReq) error
 	CopyAll(ctx context.Context, req CopyMoveReq) error
 	MoveAll(ctx context.Context, req CopyMoveReq) error
 	Put(ctx context.Context, req PutReq) error
